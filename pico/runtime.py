@@ -22,33 +22,60 @@ from .task_state import TaskState
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
+# 敏感环境变量名标记 —— 如果环境变量名包含这些关键词，其值会被脱敏处理（替换为 <redacted>）
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
+
+# 脱敏后显示的占位值，替代真实敏感内容
 REDACTED_VALUE = "<redacted>"
+
+# Shell 环境变量白名单 —— 只有这些环境变量会被传递给子进程/shell 会话
+# 这是一种安全措施，防止敏感或无关的环境变量泄露给子进程
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
+
+# 默认功能开关 —— 控制 Claude Code 的核心功能是否启用
 DEFAULT_FEATURE_FLAGS = {
-    "memory": True,
-    "relevant_memory": True,
-    "context_reduction": True,
-    "prompt_cache": True,
+    "memory": True,              # 是否启用记忆功能（对话上下文持久化）
+    "relevant_memory": True,     # 是否自动召回相关记忆
+    "context_reduction": True,   # 是否启用上下文压缩/摘要
+    "prompt_cache": True,        # 是否使用 prompt 缓存（减少 API 成本）
 }
+
+# 检查点（checkpoint）机制的模式版本号 —— 用于判断存档格式兼容性
 CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
-CHECKPOINT_NONE_STATUS = "no-checkpoint"
-CHECKPOINT_FULL_VALID_STATUS = "full-valid"
-CHECKPOINT_PARTIAL_STALE_STATUS = "partial-stale"
-CHECKPOINT_WORKSPACE_MISMATCH_STATUS = "workspace-mismatch"
-CHECKPOINT_SCHEMA_MISMATCH_STATUS = "schema-mismatch"
+
+# 检查点状态常量 —— 表示当前检查点的各种有效性状态
+CHECKPOINT_NONE_STATUS = "no-checkpoint"                       # 没有检查点
+CHECKPOINT_FULL_VALID_STATUS = "full-valid"                    # 完全有效，可以直接恢复
+CHECKPOINT_PARTIAL_STALE_STATUS = "partial-stale"              # 部分过期，部分信息不可用
+CHECKPOINT_WORKSPACE_MISMATCH_STATUS = "workspace-mismatch"    # 工作区不匹配（可能切换了项目）
+CHECKPOINT_SCHEMA_MISMATCH_STATUS = "schema-mismatch"          # 模式版本不匹配，格式不兼容
+
+# 英语持久记忆意图识别正则 —— 匹配用户消息中表示"记住某事"的动词
+# 当消息匹配此模式时，系统会触发持久记忆存储流程
 DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
+
+# 中文持久记忆意图识别正则 —— 匹配中文中表示"记住"的词汇
 DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
+
+# 持久记忆行模式 —— 用特定前缀标记不同类型的记忆条目
+# 用户可以在对话中使用这些前缀，系统会自动解析并分类存储
 DURABLE_MEMORY_LINE_PATTERNS = (
-    ("project-conventions", re.compile(r"(?i)^Project convention:\s*(.+)$")),
-    ("key-decisions", re.compile(r"(?i)^Decision:\s*(.+)$")),
-    ("dependency-facts", re.compile(r"(?i)^Dependency:\s*(.+)$")),
-    ("user-preferences", re.compile(r"(?i)^Preference:\s*(.+)$")),
+    # 英文前缀
+    ("project-conventions", re.compile(r"(?i)^Project convention:\s*(.+)$")),  # 项目约定
+    ("key-decisions",        re.compile(r"(?i)^Decision:\s*(.+)$")),           # 关键决策
+    ("dependency-facts",     re.compile(r"(?i)^Dependency:\s*(.+)$")),         # 依赖事实
+    ("user-preferences",     re.compile(r"(?i)^Preference:\s*(.+)$")),         # 用户偏好
+    # 中文前缀（功能同上）
     ("project-conventions", re.compile(r"^项目约定：\s*(.+)$")),
-    ("key-decisions", re.compile(r"^决策：\s*(.+)$")),
-    ("dependency-facts", re.compile(r"^依赖：\s*(.+)$")),
-    ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
+    ("key-decisions",        re.compile(r"^决策：\s*(.+)$")),
+    ("dependency-facts",     re.compile(r"^依赖：\s*(.+)$")),
+    ("user-preferences",     re.compile(r"^偏好：\s*(.+)$")),
 )
+
+# 秘密形状文本检测正则 —— 用于在输出/日志中扫描可能泄露的敏感信息
+# 匹配两类模式：
+#   1. 包含 api_key / token / secret / password 关键词的文本（可能以 api-key、api_key 等形式出现）
+#   2. 以 "sk-" 开头的字符串（OpenAI/Anthropic 等 API Key 的常见前缀，长度 >= 6）
 SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})")
 
 
@@ -65,22 +92,36 @@ class PromptPrefix:
 
 class SessionStore:
     def __init__(self, root):
+        # 会话文件的根目录，例如 .pico/sessions/
         self.root = Path(root)
+
+        # 确保目录存在；parents=True 表示父目录不存在也一起创建
         self.root.mkdir(parents=True, exist_ok=True)
 
     def path(self, session_id):
+        # 根据 session_id 生成对应的 JSON 文件路径
         return self.root / f"{session_id}.json"
 
     def save(self, session):
+        # 用 session["id"] 决定保存到哪个文件
         path = self.path(session["id"])
+
+        # 把 session 字典序列化成格式化 JSON，并写入本地文件
         path.write_text(json.dumps(session, indent=2), encoding="utf-8")
+
+        # 返回保存后的文件路径，方便外部查看或记录
         return path
 
     def load(self, session_id):
+        # 读取指定 session_id 对应的 JSON 文件，并反序列化为 Python 字典
         return json.loads(self.path(session_id).read_text(encoding="utf-8"))
 
     def latest(self):
+        # 找到 sessions 目录下所有 .json 会话文件，并按修改时间排序
         files = sorted(self.root.glob("*.json"), key=lambda path: path.stat().st_mtime)
+
+        # 如果存在会话文件，返回最新文件的文件名主体，也就是 session_id
+        # 如果没有任何会话文件，则返回 None
         return files[-1].stem if files else None
 
 
@@ -321,12 +362,19 @@ class Pico:
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
     def build_prefix(self):
+        # 先把当前可用工具渲染成文本清单，后面会放进 prompt prefix
         tool_lines = []
         for name, tool in self.tools.items():
+            # 把工具参数 schema 拼成一行，比如 path: str, start: int=1
             fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
+            # 标记工具风险等级：高风险工具需要审批，普通工具是 safe
             risk = "approval required" if tool["risky"] else "safe"
             tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
+
+        # 多个工具说明用换行拼成完整工具区块
         tool_text = "\n".join(tool_lines)
+
+        # 给模型提供合法输出示例，降低它乱写工具调用格式的概率
         examples = "\n".join(
             [
                 '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
@@ -337,6 +385,7 @@ class Pico:
                 "<final>Done.</final>",
             ]
         )
+
         # prefix 可以理解成 agent 的“工作手册”：
         # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
         text = textwrap.dedent(
@@ -347,11 +396,11 @@ class Pico:
             - Use tools instead of guessing about the workspace.
             - Return exactly one <tool>...</tool> or one <final>...</final>.
             - Tool calls must look like:
-              <tool>{{"name":"tool_name","args":{{...}}}}</tool>
+            <tool>{{"name":"tool_name","args":{{...}}}}</tool>
             - For write_file and patch_file with multi-line text, prefer XML style:
-              <tool name="write_file" path="file.py"><content>...</content></tool>
+            <tool name="write_file" path="file.py"><content>...</content></tool>
             - Final answers must look like:
-              <final>your answer</final>
+            <final>your answer</final>
             - Never invent tool results.
             - Keep answers concise and concrete.
             - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
@@ -370,6 +419,8 @@ class Pico:
             {self.workspace.text()}
             """
         ).strip()
+
+        # 返回带元数据的 PromptPrefix，方便后续判断 prefix 是否能复用或需要重建
         return PromptPrefix(
             text=text,
             hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -383,26 +434,39 @@ class Pico:
         self.prefix = prefix_state.text
 
     def refresh_prefix(self, force=False):
+        # 取出上一次 prefix 的 hash；如果还没构建过 prefix，就拿到 None
         previous_hash = getattr(getattr(self, "prefix_state", None), "hash", None)
+
+        # 取出上一次工作区指纹，用来判断仓库状态有没有变化
         previous_workspace_fingerprint = getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", None)
 
         # 工作区事实相对稳定，所以这里按整体刷新；
         # 只有这些事实真的变化了，才重建完整 prefix。
         refreshed_workspace = WorkspaceContext.build(self.root)
         refreshed_workspace_fingerprint = refreshed_workspace.fingerprint()
+
+        # force=True 时强制认为工作区变化；否则通过 fingerprint 判断
         workspace_changed = force or refreshed_workspace_fingerprint != previous_workspace_fingerprint
         if workspace_changed:
+            # 如果工作区变化，就把 agent 当前持有的 workspace 更新成最新快照
             self.workspace = refreshed_workspace
 
+        # 只有工作区变化、强制刷新、或者之前没有 prefix 时，才重新 build_prefix
         prefix_state = self.build_prefix() if workspace_changed or force or previous_hash is None else self.prefix_state
+
+        # 判断 prefix 文本本身是否变化
         prefix_changed = force or previous_hash != prefix_state.hash
         if prefix_changed:
+            # prefix 变化后，同步更新 self.prefix_state 和 self.prefix
             self._apply_prefix_state(prefix_state)
 
+        # 记录本次刷新结果，后续可以写进 prompt metadata / trace
         self._last_prefix_refresh = {
             "workspace_changed": workspace_changed,
             "prefix_changed": prefix_changed,
         }
+
+        # 返回一份普通 dict，避免外部直接改内部状态
         return dict(self._last_prefix_refresh)
 
     def memory_text(self):
@@ -773,25 +837,42 @@ class Pico:
         如果新人想理解 pico 是怎么“从一句话跑成一个 agent 流程”的，
         这里就是最关键的入口。
         """
+        # 记录本次 ask() 开始的单调时钟时间，用于后面计算运行耗时
         run_started_at = time.monotonic()
+        # 把当前用户请求写入工作记忆的任务摘要，方便后续 prompt 继续围绕这个目标推进
         self.memory.set_task_summary(user_message)
+        # 把用户消息写入 session history，并记录创建时间
         self.record({"role": "user", "content": user_message, "created_at": now()})
-
+        # 创建本次运行的 TaskState；run_id 标识一次运行，task_id 标识一次用户任务
         task_state = TaskState.create(run_id=self.new_run_id(), task_id=self.new_task_id(), user_request=user_message)
+        # 记录当前恢复状态，方便后续 report/trace 里知道这次是不是从 checkpoint 接着跑
         task_state.resume_status = self.resume_state.get("status", CHECKPOINT_NONE_STATUS)
+        # 保存当前任务状态到 agent 实例上，供运行过程中的其他方法访问
         self.current_task_state = task_state
+        # 为本次 run 创建工件目录，并写入初始 task_state.json
         self.current_run_dir = self.run_store.start_run(task_state)
+
+        # 写入一条 run_started trace，表示这次运行正式开始
         self.emit_trace(
             task_state,
             "run_started",
             {
+                # 当前任务 ID
                 "task_id": task_state.task_id,
+
+                # 用户请求做截断后写入 trace，避免 trace 里塞入过长内容
                 "user_request": clip(user_message, 300),
             },
         )
 
+        # 已执行的工具调用次数
         tool_steps = 0
+
+        # 已调用模型的轮数
         attempts = 0
+
+        # 最大尝试次数；通常是工具步数上限的 3 倍，但至少比 max_steps 多 4 次
+        # 这样可以给解析失败、retry、格式修正留出一点余量
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)
 
         # 这是 agent 的主循环，可以按“感知 -> 决策 -> 行动 -> 记录”来理解：
@@ -869,21 +950,33 @@ class Pico:
                 # 只有后端明确支持时，才把稳定前缀的 hash 作为 cache key 发出去。
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
+
+            # 记录模型调用开始时间，用于统计本轮模型请求耗时
             model_started_at = time.monotonic()
+
+            # 调用模型后端，传入完整 prompt、最大输出 token，以及可选的 prompt cache 参数
             raw = self.model_client.complete(
                 prompt,
                 self.max_new_tokens,
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
             )
+
+            # 读取模型客户端留下的元数据，例如 usage、cached_tokens、cache_hit 等
             completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
+
             if completion_metadata:
-                # 把后端返回的 usage/cache 统计并回 prompt_metadata，
-                # 方便统一写入 report 和 trace。
+                # 把后端返回的 usage/cache 统计并回 prompt_metadata，方便统一写入 report 和 trace。
                 prompt_metadata.update(completion_metadata)
+
+            # 保存本轮模型调用和 prompt 元数据，供后续 report、trace 或调试使用
             self.last_completion_metadata = completion_metadata
             self.last_prompt_metadata = prompt_metadata
+
+            # 解析模型原始输出，把文本转成 runtime 能识别的分支：tool / final / retry
             kind, payload = self.parse(raw)
+
+            # 写入 model_parsed trace，记录解析结果、模型元数据和调用耗时
             self.emit_trace(
                 task_state,
                 "model_parsed",
@@ -895,12 +988,19 @@ class Pico:
             )
 
             if kind == "tool":
+                # 进入工具分支，统计本次 run 已经执行了多少步工具
                 tool_steps += 1
                 name = payload.get("name", "")
                 args = payload.get("args", {})
+
+                # 把工具调用记录进 TaskState，更新 tool_steps 和 last_tool
                 task_state.record_tool(name)
+
+                # 记录工具执行开始时间，用于后面统计工具耗时
                 tool_started_at = time.monotonic()
                 result = self.run_tool(name, args)
+
+                # 把工具执行结果写入 session history，下一轮 prompt 可以看到这次工具反馈
                 self.record(
                     {
                         "role": "tool",
@@ -910,7 +1010,11 @@ class Pico:
                         "created_at": now(),
                     }
                 )
+
+                # 工具执行后更新 task_state.json，保留当前运行进度
                 self.run_store.write_task_state(task_state)
+
+                # 写入 tool_executed trace，记录工具名、参数、裁剪后的结果和耗时
                 self.emit_trace(
                     task_state,
                     "tool_executed",
@@ -922,8 +1026,12 @@ class Pico:
                         **dict(self._last_tool_result_metadata or {}),
                     },
                 )
+
+                # 工具执行后创建 checkpoint，方便后续 resume 时从关键状态接着跑
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
                 self.run_store.write_task_state(task_state)
+
+                # 写入 checkpoint_created trace，记录 checkpoint 是在哪个触发点生成的
                 self.emit_trace(
                     task_state,
                     "checkpoint_created",
@@ -935,16 +1043,24 @@ class Pico:
                 continue
 
             if kind == "retry":
+                # retry 表示模型输出没能形成有效 tool/final，把提示内容记入 history 后进入下一轮
                 self.record({"role": "assistant", "content": payload, "created_at": now()})
                 self.run_store.write_task_state(task_state)
                 continue
 
+            # 取出最终回答；payload 优先，没有 payload 就用模型原始输出 raw
             final = (payload or raw).strip()
+            # 把最终回答写入 session history
             self.record({"role": "assistant", "content": final, "created_at": now()})
+            # 标记任务成功完成，并写入 final_answer 和 stop_reason
             task_state.finish_success(final)
+            # 根据用户请求和最终回答，尝试提取可长期保存的 durable memory
             self.promote_durable_memory(user_message, final)
+            # 运行结束时创建 checkpoint，保存这次任务的收尾状态
             checkpoint = self.create_checkpoint(task_state, user_message, trigger="run_finished")
+            # 写入最新 task_state.json
             self.run_store.write_task_state(task_state)
+            # 写入 checkpoint_created trace，记录收尾 checkpoint
             self.emit_trace(
                 task_state,
                 "checkpoint_created",
@@ -953,6 +1069,7 @@ class Pico:
                     "trigger": "run_finished",
                 },
             )
+            # 写入 run_finished trace，记录最终状态、停止原因、最终回答和总耗时
             self.emit_trace(
                 task_state,
                 "run_finished",
@@ -963,19 +1080,29 @@ class Pico:
                     "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
                 },
             )
+            # 构建最终 report，脱敏后落盘
             self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+            # 返回最终回答给调用方
             return final
 
         if attempts >= max_attempts and tool_steps < self.max_steps:
+            # 模型尝试次数耗尽，但工具步数还没用完，说明主要卡在无效输出或解析失败
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
             task_state.stop_retry_limit(final)
         else:
+            # 工具步数达到上限但仍没有 final，说明任务执行链路已经到达边界
             final = "Stopped after reaching the step limit without a final answer."
             task_state.stop_step_limit(final)
+
+        # 把停止说明写入 session history
         self.record({"role": "assistant", "content": final, "created_at": now()})
+        # 即使异常停止，也尝试从本轮请求和停止结果中提取可长期保存的记忆
         self.promote_durable_memory(user_message, final)
+        # 写入停止后的 task_state.json
         self.run_store.write_task_state(task_state)
+        # 停止时创建 checkpoint，方便后续 resume 或复盘
         checkpoint = self.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")
+        # 记录 checkpoint 创建事件
         self.emit_trace(
             task_state,
             "checkpoint_created",
@@ -984,6 +1111,7 @@ class Pico:
                 "trigger": task_state.stop_reason or "run_stopped",
             },
         )
+        # 写入 run_finished trace，记录停止状态、停止原因、最终说明和总耗时
         self.emit_trace(
             task_state,
             "run_finished",
@@ -994,7 +1122,9 @@ class Pico:
                 "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
             },
         )
+        # 构建最终 report，脱敏后落盘
         self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+        # 返回停止说明给调用方
         return final
 
     def run_tool(self, name, args):
@@ -1021,6 +1151,7 @@ class Pico:
         # -> 真正执行 -> 更新记忆。
         tool = self.tools.get(name)
         if tool is None:
+            # 工具不存在，直接拒绝，并记录一份统一格式的工具结果元数据
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "unknown_tool",
@@ -1032,13 +1163,18 @@ class Pico:
                 "diff_summary": [],
             }
             return f"error: unknown tool '{name}'"
+
         try:
+            # 执行工具参数校验，比如路径是否合法、必填参数是否存在、范围是否正确
             self.validate_tool(name, args)
         except Exception as exc:
             example = self.tool_example(name)
             message = f"error: invalid arguments for {name}: {exc}"
             if example:
+                # 参数错误时附带一个正确调用示例，方便模型下一轮修正
                 message += f"\nexample: {example}"
+
+            # 如果错误原因是路径逃逸，就额外标记安全事件类型
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
@@ -1051,7 +1187,9 @@ class Pico:
                 "diff_summary": [],
             }
             return message
+
         if self.repeated_tool_call(name, args):
+            # 拒绝连续重复的完全相同工具调用，防止模型原地打转
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "repeated_identical_call",
@@ -1063,7 +1201,9 @@ class Pico:
                 "diff_summary": [],
             }
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
+
         if tool["risky"] and not self.approve(name, args):
+            # 高风险工具需要审批；审批失败就不执行
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "approval_denied",
@@ -1075,25 +1215,40 @@ class Pico:
                 "diff_summary": [],
             }
             return f"error: approval denied for {name}"
+
+        # 高风险工具执行前先拍一份工作区快照，用于后面判断是否改动了文件
         before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
+            # 真正执行工具，并把输出裁剪到统一长度，避免结果过长塞爆 history/trace
             result = clip(tool["run"](args))
+
+            # 高风险工具执行后再拍一次快照，用来和执行前对比
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
+
+            # 默认认为工具执行成功；后面会针对 run_shell 的非零退出码再细分
             tool_status = "ok"
             tool_error_code = ""
+
             if name == "run_shell":
+                # 从 shell 工具输出中解析 exit_code，判断命令是否失败
                 match = re.search(r"exit_code:\s*(-?\d+)", result)
                 exit_code = int(match.group(1)) if match else 0
                 if exit_code != 0 and workspace_changed:
+                    # 命令失败但已经改动了工作区，标记为部分成功
                     tool_status = "partial_success"
                     tool_error_code = "tool_partial_success"
                 elif exit_code != 0:
+                    # 命令失败且没有产生文件改动，标记为普通工具失败
                     tool_status = "error"
                     tool_error_code = "tool_failed"
+
+            # 根据工具结果更新工作记忆，比如最近读过/改过的文件、文件摘要等
             self.update_memory_after_tool(name, args, result)
+
+            # 记录本次工具执行的结构化元数据，后续会合并进 trace/report
             self._last_tool_result_metadata = {
                 "tool_status": tool_status,
                 "tool_error_code": tool_error_code,
@@ -1105,13 +1260,21 @@ class Pico:
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
             }
+
+            # 把这次工具执行过程沉淀成过程笔记，方便后续复盘或记忆更新
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return result
+
         except Exception as exc:
+            # 工具抛异常时，仍然拍执行后快照，判断是否已经造成部分改动
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
+
+            # 如果异常信息显示路径逃逸，就标记为安全事件
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
+
+            # 失败也记录统一格式的元数据；如果已经改了文件，就算 partial_success
             self._last_tool_result_metadata = {
                 "tool_status": "partial_success" if workspace_changed else "error",
                 "tool_error_code": "tool_partial_success" if workspace_changed else "tool_failed",
@@ -1123,6 +1286,8 @@ class Pico:
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
             }
+
+            # 即使工具失败，也把失败过程记录下来，避免 trace/report 断档
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return f"error: tool {name} failed: {exc}"
 
@@ -1225,39 +1390,50 @@ class Pico:
         它位于 `model_client.complete()` 之后、`run_tool()` 之前，是模型输出
         进入平台控制流的第一道结构化关口。
         """
+        # 先统一转成字符串，避免模型客户端返回非字符串对象时解析报错
         raw = str(raw)
-        # 这里支持两种工具格式：
-        # 1. <tool>...</tool> 里包 JSON，适合简短调用
-        # 2. XML 风格属性/子标签，适合写文件这类多行内容
+        # 优先处理 JSON 工具调用格式：<tool>{"name": "...", "args": {...}}</tool>
         if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
             body = Pico.extract(raw, "tool")
             try:
+                # 解析 <tool> 标签里的 JSON 内容
                 payload = json.loads(body)
             except Exception:
                 return "retry", Pico.retry_notice("model returned malformed tool JSON")
+            # 工具 payload 必须是 JSON object，不能是列表、字符串之类
             if not isinstance(payload, dict):
                 return "retry", Pico.retry_notice("tool payload must be a JSON object")
+            # 工具调用必须带 name，否则 runtime 不知道该执行哪个工具
             if not str(payload.get("name", "")).strip():
                 return "retry", Pico.retry_notice("tool payload is missing a tool name")
+            # args 允许省略或为 None，但最终要规范成 dict
             args = payload.get("args", {})
             if args is None:
                 payload["args"] = {}
             elif not isinstance(args, dict):
                 return "retry", Pico.retry_notice()
             return "tool", payload
+        
+        # 再处理 XML 风格工具调用，主要用于 write_file/patch_file 这类多行内容
         if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
             payload = Pico.parse_xml_tool(raw)
             if payload is not None:
                 return "tool", payload
             return "retry", Pico.retry_notice()
+
+        # 处理标准 final 格式：<final>...</final>
         if "<final>" in raw:
             final = Pico.extract(raw, "final").strip()
             if final:
                 return "final", final
             return "retry", Pico.retry_notice("model returned an empty <final> answer")
+
+        # 如果没有标签但有普通文本，就把它兜底当成最终答案
         raw = raw.strip()
         if raw:
             return "final", raw
+
+        # 空响应无法推进控制流，只能要求模型下一轮重试
         return "retry", Pico.retry_notice("model returned an empty response")
 
     @staticmethod

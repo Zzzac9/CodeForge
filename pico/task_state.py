@@ -8,11 +8,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
 
+# 任务状态：运行中、成功完成、主动停止、异常失败
 STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_STOPPED = "stopped"
 STATUS_FAILED = "failed"
 
+# 停止原因：用于解释这次 run 为什么结束
 STOP_REASON_FINAL_ANSWER_RETURNED = "final_answer_returned"
 STOP_REASON_STEP_LIMIT_REACHED = "step_limit_reached"
 STOP_REASON_RETRY_LIMIT_REACHED = "retry_limit_reached"
@@ -26,26 +28,39 @@ STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
 
 @dataclass
 class TaskState:
+    # run_id 标识一次具体运行，task_id 标识一次用户任务
     run_id: str
     task_id: str
     user_request: str
+
+    # 当前运行状态，默认 running
     status: str = STATUS_RUNNING
+
+    # tool_steps 统计真正执行了多少次工具；attempts 统计调用了多少轮模型
     tool_steps: int = 0
     attempts: int = 0
+
+    # 最近一次调用的工具名
     last_tool: str = ""
+
+    # 停止原因和最终回答
     stop_reason: str = ""
     final_answer: str = ""
+
+    # checkpoint_id 用于恢复现场；resume_status 记录本次运行的恢复状态
     checkpoint_id: str = ""
     resume_status: str = ""
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
+        # 如果外部没传 run_id，就按时间戳 + 随机后缀生成一个
         if not run_id:
             run_id = "run_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
         return cls(run_id=run_id, task_id=task_id, user_request=user_request)
 
     @classmethod
     def from_dict(cls, data):
+        # 从落盘的 task_state.json 恢复 TaskState，并做基础类型转换
         return cls(
             run_id=str(data.get("run_id", "")),
             task_id=str(data.get("task_id", "")),
@@ -80,21 +95,26 @@ class TaskState:
         return self
 
     def stop_step_limit(self, final_answer=""):
+        # 因为工具步数达到上限而停止
         return self.stop(STOP_REASON_STEP_LIMIT_REACHED, final_answer=final_answer)
 
     def stop_retry_limit(self, final_answer=""):
+        # 因为模型多次输出无效内容而停止
         return self.stop(STOP_REASON_RETRY_LIMIT_REACHED, final_answer=final_answer)
 
     def stop_model_error(self, final_answer=""):
+        # 因为模型调用异常而失败
         return self.stop(STOP_REASON_MODEL_ERROR, status=STATUS_FAILED, final_answer=final_answer)
 
     def finish_success(self, final_answer):
+        # 正常拿到最终答案，标记为 completed
         self.status = STATUS_COMPLETED
         self.stop_reason = STOP_REASON_FINAL_ANSWER_RETURNED
         self.final_answer = str(final_answer)
         return self
 
     def to_dict(self):
+        # 转成普通 dict，方便写入 task_state.json
         return {
             "run_id": self.run_id,
             "task_id": self.task_id,

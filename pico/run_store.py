@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 def _run_id(value):
+    # 兼容两种传参：可以直接传 run_id 字符串，也可以传带 run_id 属性的对象
     if hasattr(value, "run_id"):
         return value.run_id
     return str(value)
@@ -17,19 +18,24 @@ def _run_id(value):
 
 class RunStore:
     def __init__(self, root):
+        # root 是所有 run 工件的根目录，例如 .pico/runs/
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
     def run_dir(self, run_id):
+        # 每个 run_id 对应一个独立目录
         return self.root / _run_id(run_id)
 
     def task_state_path(self, run_id):
+        # task_state.json 保存当前 run 的状态机快照
         return self.run_dir(run_id) / "task_state.json"
 
     def trace_path(self, run_id):
+        # trace.jsonl 保存运行过程中的事件流
         return self.run_dir(run_id) / "trace.jsonl"
 
     def report_path(self, run_id):
+        # report.json 保存运行结束后的汇总报告
         return self.run_dir(run_id) / "report.json"
 
     def start_run(self, task_state):
@@ -41,12 +47,14 @@ class RunStore:
         return run_dir
 
     def write_task_state(self, task_state):
+        # 把 TaskState 转成 dict，并原子写入 task_state.json
         path = self.task_state_path(task_state)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._write_json_atomic(path, task_state.to_dict())
         return path
 
     def append_trace(self, task_state, event):
+        # 向 trace.jsonl 追加一条事件
         path = self.trace_path(task_state)
         path.parent.mkdir(parents=True, exist_ok=True)
         # trace 采用 jsonl 追加写入，原因是 agent 运行过程是流式事件序列，
@@ -57,15 +65,18 @@ class RunStore:
         return path
 
     def write_report(self, task_state, report):
+        # 把最终 report 原子写入 report.json
         path = self.report_path(task_state)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._write_json_atomic(path, report)
         return path
 
     def load_task_state(self, task_id):
+        # 读取指定 run/task 对应的 task_state.json
         return json.loads(self.task_state_path(task_id).read_text(encoding="utf-8"))
 
     def load_report(self, task_id):
+        # 读取指定 run/task 对应的 report.json
         return json.loads(self.report_path(task_id).read_text(encoding="utf-8"))
 
     def _write_json_atomic(self, path, payload):
