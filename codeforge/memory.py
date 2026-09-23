@@ -486,7 +486,7 @@ def normalize_memory_state(state, workspace_root=None):
     state["notes"] = [note["text"] for note in episodic_notes]
 
     # 如果有 workspace_root，就顺手读取 durable memory 里已有的 topic 列表
-    durable_root = Path(workspace_root) / ".pico" / "memory" if workspace_root is not None else None
+    durable_root = Path(workspace_root) / ".codeforge" / "memory" if workspace_root is not None else None
     durable_store = DurableMemoryStore(durable_root) if durable_root is not None else None
     state["durable_topics"] = durable_store.topic_slugs() if durable_store is not None else []
     return state
@@ -637,7 +637,7 @@ def retrieval_candidates(state, query, limit=3, workspace_root=None):
 
     # 如果有工作区，就把 durable memory 里的长期 note 也纳入召回
     if workspace_root is not None:
-        durable_store = DurableMemoryStore(Path(workspace_root) / ".pico" / "memory")
+        durable_store = DurableMemoryStore(Path(workspace_root) / ".codeforge" / "memory")
         for note in durable_store.retrieval_candidates(query, limit=limit):
             note_tags = {tag.lower() for tag in note.get("tags", [])}
             note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
@@ -718,7 +718,7 @@ class LayeredMemory:
         self.state = normalize_memory_state(state, workspace_root)
 
         # 有工作区时才启用长期记忆存储；否则只使用内存里的短期状态
-        self.durable_store = DurableMemoryStore(Path(workspace_root) / ".pico" / "memory") if workspace_root is not None else None
+        self.durable_store = DurableMemoryStore(Path(workspace_root) / ".codeforge" / "memory") if workspace_root is not None else None
 
     def to_dict(self):
         # 导出前再规范化一次，保证写回 session 的结构是最新格式

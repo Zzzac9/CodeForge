@@ -18,7 +18,7 @@ def _run_id(value):
 
 class RunStore:
     def __init__(self, root):
-        # root 是所有 run 工件的根目录，例如 .pico/runs/
+        # root 是所有 run 工件的根目录，例如 .codeforge/runs/
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 

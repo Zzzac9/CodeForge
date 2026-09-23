@@ -1,6 +1,6 @@
-# pico 完整实现逻辑与设计文档
+# codeforge 完整实现逻辑与设计文档
 
-> pico 是一个面向代码仓库的轻量本地 coding agent。它直接跑在终端里，先看当前工作区，再用一组受约束的工具去读文件、改文件、跑命令，并把会话状态保存在本地 `.pico/` 目录里。
+> codeforge 是一个面向代码仓库的轻量本地 coding agent。它直接跑在终端里，先看当前工作区，再用一组受约束的工具去读文件、改文件、跑命令，并把会话状态保存在本地 `.codeforge/` 目录里。
 
 ---
 
@@ -10,7 +10,7 @@
 - [2. 启动链路](#2-启动链路)
 - [3. 配置层](#3-配置层)
 - [4. 模型后端适配](#4-模型后端适配)
-- [5. 核心运行时 (Pico)](#5-核心运行时-pico)
+- [5. 核心运行时 (CodeForge)](#5-核心运行时-codeforge)
 - [6. 工具系统](#6-工具系统)
 - [7. 工作区快照](#7-工作区快照)
 - [8. 上下文管理器](#8-上下文管理器)
@@ -31,18 +31,18 @@
 - **语言**：Python 3.10+
 - **依赖**：零外部依赖（仅标准库 `urllib`、`subprocess`、`json`、`argparse` 等）
 - **安装**：`pip install -e .` 或 `uv sync`
-- **CLI 命令**：`pico` 或 `python -m pico`
+- **CLI 命令**：`codeforge` 或 `python -m codeforge`
 
 ### 1.2 源文件结构（13 个模块）
 
 ```
-pico/
+codeforge/
 ├── __init__.py          # 公开 API 导出
-├── __main__.py          # python -m pico 入口 → 调 cli.main()
+├── __main__.py          # python -m codeforge 入口 → 调 cli.main()
 ├── cli.py               # 命令行解析 + REPL/one-shot 主循环
 ├── config.py            # .env 文件加载 + 环境变量优先级链
 ├── models.py            # 4 种模型后端的 HTTP 适配层
-├── runtime.py           # 核心 agent 控制循环 (Pico 类, 1349 行)
+├── runtime.py           # 核心 agent 控制循环 (CodeForge 类, 1349 行)
 ├── tools.py             # 7 个工具的定义、校验、执行
 ├── workspace.py         # Git 工作区事实快照
 ├── context_manager.py   # Prompt 组装 + 预算收缩
@@ -56,7 +56,7 @@ pico/
 ### 1.3 对象依赖图
 
 ```
-Pico (runtime.py)
+CodeForge (runtime.py)
 ├── model_client      # models.py — Ollama / OpenAI / Anthropic / Fake
 ├── workspace         # workspace.py — Git 事实 + 项目文档
 ├── session_store     # runtime.py:SessionStore — 会话持久化
@@ -73,7 +73,7 @@ Pico (runtime.py)
 ## 2. 启动链路
 
 ```
-python -m pico  /  pico CLI
+python -m codeforge  /  codeforge CLI
         │
         ▼
 __main__.py → cli.main()
@@ -97,18 +97,18 @@ __main__.py → cli.main()
         │     ├── load_project_env(workspace.repo_root)
         │     │     └── 从 repo root 向上找 .env, 注入 os.environ
         │     ├── 整理 secret 环境变量白名单
-        │     ├── 创建 SessionStore (.pico/sessions/)
+        │     ├── 创建 SessionStore (.codeforge/sessions/)
         │     ├── _build_model_client(args)
         │     │     └── 根据 provider 创建对应的 HTTP client
-        │     └── 如果 --resume: Pico.from_session()
-        │         否则: 新建 Pico()
+        │     └── 如果 --resume: CodeForge.from_session()
+        │         否则: 新建 CodeForge()
         │
         ├── 3. 打印欢迎界面 (build_welcome)
         │     ASCII 猫头 + 工作区/模型/审批/会话信息
         │
         └── 4. 进入运行模式
               ├── One-shot: 有命令行 prompt → agent.ask(prompt) → 打印 → 退出
-              └── REPL: while True: input("pico> ") → agent.ask(input)
+              └── REPL: while True: input("codeforge> ") → agent.ask(input)
                     内置命令:
                     ├── /help    → 查看帮助
                     ├── /memory  → 查看工作记忆
@@ -126,7 +126,7 @@ __main__.py → cli.main()
 ### 3.1 优先级链
 
 ```
-显式 CLI 参数 > .env 里的 PICO_* 变量 > 旧环境变量名 (兼容) > 代码默认值
+显式 CLI 参数 > .env 里的 CODEFORGE_* 变量 > 旧环境变量名 (兼容) > 代码默认值
 ```
 
 ### 3.2 关键函数
@@ -135,7 +135,7 @@ __main__.py → cli.main()
 |---|---|
 | `find_project_env(start)` | 从当前目录向上遍历找 `.env` 文件 |
 | `load_project_env(start)` | 解析 `.env` 中的 `KEY=VALUE` 行并注入 `os.environ`，支持 `export` 前缀和引号值 |
-| `provider_env(name, legacy_names, default)` | 按优先级链查找：`PICO_XXX` → 旧名列表 → default |
+| `provider_env(name, legacy_names, default)` | 按优先级链查找：`CODEFORGE_XXX` → 旧名列表 → default |
 
 ---
 
@@ -191,18 +191,18 @@ def complete(self, prompt, max_new_tokens,
 
 ---
 
-## 5. 核心运行时 (Pico)
+## 5. 核心运行时 (CodeForge)
 
-`runtime.py`（1349 行）是整个项目的心脏。`Pico` 类持有 agent 的全部状态。
+`runtime.py`（1349 行）是整个项目的心脏。`CodeForge` 类持有 agent 的全部状态。
 
 ### 5.1 对象图
 
 ```
-Pico
+CodeForge
 ├── model_client        # 模型后端 (Ollama/OpenAI/Anthropic/Fake)
 ├── workspace           # WorkspaceContext — Git 事实 + 项目文档快照
-├── session_store       # SessionStore — .pico/sessions/ 的 CRUD
-├── run_store           # RunStore — .pico/runs/<run_id>/ 工件管理
+├── session_store       # SessionStore — .codeforge/sessions/ 的 CRUD
+├── run_store           # RunStore — .codeforge/runs/<run_id>/ 工件管理
 ├── memory              # LayeredMemory — 工作记忆
 ├── context_manager     # ContextManager — prompt 组装与预算控制
 ├── tools               # dict: tool_name → callable
@@ -224,7 +224,7 @@ ask(user_message)
   │
   ├── 0. 初始化
   │     ├── TaskState.create()           # 创建任务状态机
-  │     ├── run_store.start_run()        # 创建 .pico/runs/<run_id>/
+  │     ├── run_store.start_run()        # 创建 .codeforge/runs/<run_id>/
   │     ├── record({"role":"user", ...}) # 记入 history
   │     └── tool_steps = 0, attempts = 0
   │
@@ -376,7 +376,7 @@ def path(self, raw_path):
 ### 6.2 各工具实现细节
 
 **`list_files`**：
-- 跳过 IGNORED_PATH_NAMES：`.git`、`.pico`、`__pycache__`、`.venv`、`node_modules` 等
+- 跳过 IGNORED_PATH_NAMES：`.git`、`.codeforge`、`__pycache__`、`.venv`、`node_modules` 等
 - 最多返回 200 条
 - 标记 `[D]` 目录 / `[F]` 文件
 
@@ -406,7 +406,7 @@ def path(self, raw_path):
 - 命中 N 次 → error: "ambiguous, matched N times"
 
 **`delegate`**：
-- 创建子 `Pico` 实例：
+- 创建子 `CodeForge` 实例：
   - `read_only=True`
   - `approval_policy="never"`
   - `depth = parent_depth + 1`
@@ -556,9 +556,9 @@ relevant_memory → history → memory → prefix
 
 ### 9.4 DurableMemoryStore（持久记忆）
 
-存盘到 `.pico/memory/`：
+存盘到 `.codeforge/memory/`：
 ```
-.pico/memory/
+.codeforge/memory/
 ├── MEMORY.md           # 索引文件
 └── topics/
     ├── project-conventions.md
@@ -623,14 +623,14 @@ relevant_memory → history → memory → prefix
 
 ### 10.3 Session 持久化
 
-`SessionStore` 管理 `.pico/sessions/{id}.json`，包含完整的 history、memory、checkpoint。
+`SessionStore` 管理 `.codeforge/sessions/{id}.json`，包含完整的 history、memory、checkpoint。
 
 恢复链路：
 ```
 --resume latest
     → SessionStore.latest() 找到最新的 session
     → SessionStore.load(session_id) 加载 JSON
-    → Pico.from_session(...) 重建 Pico 实例
+    → CodeForge.from_session(...) 重建 CodeForge 实例
     → evaluate_resume_state() 评估 checkpoint 新鲜度
     → 在 prompt 中注入 checkpoint context
 ```
@@ -646,7 +646,7 @@ relevant_memory → history → memory → prefix
 每次 `ask()` 产生一个 `run_<timestamp>` 目录：
 
 ```
-.pico/runs/run_20260101_120000/
+.codeforge/runs/run_20260101_120000/
 ├── task_state.json   # 任务状态机快照（每步更新，原子写入）
 ├── trace.jsonl       # 逐事件时间线（追加写入）
 └── report.json       # 最终审计报告（原子写入）
@@ -687,7 +687,7 @@ running → failed     (exception)
 ### 12.1 路径沙箱
 
 ```python
-Pico.path(raw_path)
+CodeForge.path(raw_path)
     → os.path.normpath(os.path.join(workspace.cwd, raw_path))
     → 检查 commonpath 必须在 workspace.repo_root 之下
     → 防止 ../ 和符号链接逃逸
@@ -703,7 +703,7 @@ Pico.path(raw_path)
 ### 12.3 Secret 脱敏
 
 ```python
-Pico.redact_text(text)
+CodeForge.redact_text(text)
     → 遍历 secret_env_names
     → 用 os.environ[name] 的值替换为 "<redacted>"
 ```
@@ -712,7 +712,7 @@ Pico.redact_text(text)
 
 ### 12.4 子 Agent 只读委托
 
-`tool_delegate` 创建子 `Pico` 时：
+`tool_delegate` 创建子 `CodeForge` 时：
 - `read_only=True` → 不能执行 write_file / patch_file / run_shell
 - `approval_policy="never"` → 不弹交互确认
 - `depth + 1`，有最大深度限制
@@ -761,14 +761,14 @@ Pico.redact_text(text)
   │
   ▼
 cli.main()
-  └── while True: input("pico> ") → agent.ask(user_input)
+  └── while True: input("codeforge> ") → agent.ask(user_input)
   │
   ▼
-Pico.ask("帮我修复 test_login.py 的断言错误")
+CodeForge.ask("帮我修复 test_login.py 的断言错误")
   │
   ├── record({"role":"user", "content":"帮我修复 test_login.py 的断言错误"})
   ├── TaskState.create()                    # 创建任务状态: status=running
-  ├── run_store.start_run()                 # 创建 .pico/runs/run_20260101_120000/
+  ├── run_store.start_run()                 # 创建 .codeforge/runs/run_20260101_120000/
   │
   └── 主控制循环 ─────────────────────────────────────────────
        │
@@ -833,7 +833,7 @@ Pico.ask("帮我修复 test_login.py 的断言错误")
        │
        └── 最终处理 ─────────────────────────────────────────
              ├── promote_durable_memory()
-             │     └── 从 final answer 提取标记行 → 写入 .pico/memory/topics/
+             │     └── 从 final answer 提取标记行 → 写入 .codeforge/memory/topics/
              ├── write_report()                # 写 report.json
              ├── write_task_state()            # status = completed
              └── return "已将 test_login.py 中的断言..."
@@ -917,12 +917,12 @@ Secret 脱敏 (trace/report 自动打码)
 
 ### 15.10 本地优先
 
-- 所有状态保存在 `.pico/` 目录（sessions/ + runs/ + memory/）
+- 所有状态保存在 `.codeforge/` 目录（sessions/ + runs/ + memory/）
 - 不需要外部服务
 - 不需要数据库
 - 不需要网络（除模型 API 调用外）
-- 不建议提交 `.pico/` 到 git（已在 `.gitignore`）
+- 不建议提交 `.codeforge/` 到 git（已在 `.gitignore`）
 
 ---
 
-> **一句话总结**：pico 是一个用 Python 标准库构建的、面向本地仓库的轻量 coding agent。它通过白名单工具 + 多层护栏保证安全，通过上下文预算控制保证效率，通过 checkpoint/resume 保证连续性，通过 trace/report 保证可审计。它的核心哲学是"受约束的能力比开放式的能力更可靠"。
+> **一句话总结**：codeforge 是一个用 Python 标准库构建的、面向本地仓库的轻量 coding agent。它通过白名单工具 + 多层护栏保证安全，通过上下文预算控制保证效率，通过 checkpoint/resume 保证连续性，通过 trace/report 保证可审计。它的核心哲学是"受约束的能力比开放式的能力更可靠"。

@@ -21,7 +21,7 @@ MAX_HISTORY = 12000
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
 # 文件扫描时跳过的目录集合。这些目录要么是 VCS 元数据，要么是
 # 构建/缓存产物，扫描它们只会增加噪声而不会带来有用信息。
-IGNORED_PATH_NAMES = {".git", ".pico", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
+IGNORED_PATH_NAMES = {".git", ".codeforge", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
 
 
 def now():

@@ -1,13 +1,13 @@
 """命令行入口。
 
-这个模块负责把"用户怎么启动 pico"翻译成 runtime 能理解的对象：
+这个模块负责把"用户怎么启动 codeforge"翻译成 runtime 能理解的对象：
 解析参数、挑模型后端、构建工作区快照、恢复或新建 session，
 最后进入 one-shot 或交互式循环。
 
 整体调用链：
-  main() -> build_arg_parser() -> build_agent() -> Pico.ask()
+  main() -> build_arg_parser() -> build_agent() -> CodeForge.ask()
   其中 build_agent() 内部装配 workspace / model client / session store，
-  最终返回一个可运行的 Pico 实例。
+  最终返回一个可运行的 CodeForge 实例。
 """
 
 import argparse
@@ -18,23 +18,23 @@ import textwrap
 
 from .config import load_project_env, provider_env
 from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
-from .runtime import Pico, SessionStore
+from .runtime import CodeForge, SessionStore
 from .workspace import WorkspaceContext, middle
 
 # 默认的敏感环境变量名单。
 # 这些变量名会在 trace / report 输出中被自动脱敏（redact），
 # 防止 API key、token 等凭据意外泄露到日志或会话文件里。
-# 用户可通过 --secret-env-name 追加，或通过 PICO_SECRET_ENV_NAMES 环境变量扩展。
+# 用户可通过 --secret-env-name 追加，或通过 CODEFORGE_SECRET_ENV_NAMES 环境变量扩展。
 DEFAULT_SECRET_ENV_NAMES = (
-    "PICO_OPENAI_API_KEY",
+    "CODEFORGE_OPENAI_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_API_TOKEN",
-    "PICO_ANTHROPIC_API_KEY",
+    "CODEFORGE_ANTHROPIC_API_KEY",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
-    "PICO_DEEPSEEK_API_KEY",
+    "CODEFORGE_DEEPSEEK_API_KEY",
     "DEEPSEEK_API_KEY",
-    "PICO_RIGHT_CODES_API_KEY",
+    "CODEFORGE_RIGHT_CODES_API_KEY",
     "RIGHT_CODES_API_KEY",
     "GITHUB_PAT",
     "GH_PAT",
@@ -47,7 +47,7 @@ WELCOME_ART = (
     "       /   ^   \\\\",
     "      /|       |\\\\",
 )
-WELCOME_NAME = "pico"
+WELCOME_NAME = "codeforge"
 WELCOME_SUBTITLE = "local coding agent"
 WELCOME_STATUS = "calm shell, ready for work"
 # /help 命令显示的帮助文本，列出所有可用的交互式命令。
@@ -75,7 +75,7 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
 # 旧版项目名称为 mini-coding-agent，保留此环境变量名以兼容旧配置。
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
-SECRET_ENV_NAMES_VAR = "PICO_SECRET_ENV_NAMES"
+SECRET_ENV_NAMES_VAR = "CODEFORGE_SECRET_ENV_NAMES"
 
 
 def _effective_model(args, provider):
@@ -83,7 +83,7 @@ def _effective_model(args, provider):
 
     模型选择优先级（由高到低）：
     1. 用户显式传入 --model 参数
-    2. provider 对应的环境变量（如 PICO_OPENAI_MODEL）
+    2. provider 对应的环境变量（如 CODEFORGE_OPENAI_MODEL）
     3. 代码里的默认值（如 DEFAULT_OPENAI_MODEL）
 
     Args:
@@ -97,17 +97,17 @@ def _effective_model(args, provider):
     if explicit_model:
         return explicit_model
     if provider == "openai":
-        model = provider_env("PICO_OPENAI_MODEL", ("OPENAI_MODEL",))
+        model = provider_env("CODEFORGE_OPENAI_MODEL", ("OPENAI_MODEL",))
         if model:
             return model
         return DEFAULT_OPENAI_MODEL
     if provider == "anthropic":
-        model = provider_env("PICO_ANTHROPIC_MODEL", ("ANTHROPIC_MODEL",))
+        model = provider_env("CODEFORGE_ANTHROPIC_MODEL", ("ANTHROPIC_MODEL",))
         if model:
             return model
         return DEFAULT_ANTHROPIC_MODEL
     if provider == "deepseek":
-        model = provider_env("PICO_DEEPSEEK_MODEL", ("DEEPSEEK_MODEL",))
+        model = provider_env("CODEFORGE_DEEPSEEK_MODEL", ("DEEPSEEK_MODEL",))
         if model:
             return model
         return DEFAULT_DEEPSEEK_MODEL
@@ -122,7 +122,7 @@ def _configured_secret_names(args):
     来源有三：
     - DEFAULT_SECRET_ENV_NAMES：代码内置的默认名单。
     - --secret-env-name CLI 参数：用户显式追加的变量名。
-    - PICO_SECRET_ENV_NAMES 环境变量（兼容旧名 MINI_CODING_AGENT_SECRET_ENV_NAMES）：
+    - CODEFORGE_SECRET_ENV_NAMES 环境变量（兼容旧名 MINI_CODING_AGENT_SECRET_ENV_NAMES）：
       以逗号分隔的变量名列表。
 
     所有名称统一转为大写，最终去重排序后返回。
@@ -159,8 +159,8 @@ def _build_model_client(args):
 
     if provider == "openai":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("PICO_OPENAI_API_BASE", ("OPENAI_API_BASE",), DEFAULT_OPENAI_BASE_URL)
-        api_key = provider_env("PICO_OPENAI_API_KEY", ("OPENAI_API_KEY",))
+        base_url = getattr(args, "base_url", None) or provider_env("CODEFORGE_OPENAI_API_BASE", ("OPENAI_API_BASE",), DEFAULT_OPENAI_BASE_URL)
+        api_key = provider_env("CODEFORGE_OPENAI_API_KEY", ("OPENAI_API_KEY",))
         return OpenAICompatibleModelClient(
             model=model,
             base_url=base_url,
@@ -170,13 +170,13 @@ def _build_model_client(args):
         )
     if provider == "anthropic":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("PICO_ANTHROPIC_API_BASE", ("ANTHROPIC_API_BASE",), DEFAULT_ANTHROPIC_BASE_URL)
+        base_url = getattr(args, "base_url", None) or provider_env("CODEFORGE_ANTHROPIC_API_BASE", ("ANTHROPIC_API_BASE",), DEFAULT_ANTHROPIC_BASE_URL)
         # Anthropic provider 的 API key 有多个回退路径：
-        # 优先 PICO_ANTHROPIC_API_KEY，其次 ANTHROPIC_API_KEY，
+        # 优先 CODEFORGE_ANTHROPIC_API_KEY，其次 ANTHROPIC_API_KEY，
         # 再回退到 RIGHT_CODES / OPENAI 的 key（兼容共用网关场景）。
         api_key = provider_env(
-            "PICO_ANTHROPIC_API_KEY",
-            ("ANTHROPIC_API_KEY", "PICO_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "PICO_OPENAI_API_KEY", "OPENAI_API_KEY"),
+            "CODEFORGE_ANTHROPIC_API_KEY",
+            ("ANTHROPIC_API_KEY", "CODEFORGE_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "CODEFORGE_OPENAI_API_KEY", "OPENAI_API_KEY"),
         )
         return AnthropicCompatibleModelClient(
             model=model,
@@ -187,8 +187,8 @@ def _build_model_client(args):
         )
     if provider == "deepseek":
         model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("PICO_DEEPSEEK_API_BASE", ("DEEPSEEK_API_BASE",), DEFAULT_DEEPSEEK_BASE_URL)
-        api_key = provider_env("PICO_DEEPSEEK_API_KEY", ("DEEPSEEK_API_KEY",))
+        base_url = getattr(args, "base_url", None) or provider_env("CODEFORGE_DEEPSEEK_API_BASE", ("DEEPSEEK_API_BASE",), DEFAULT_DEEPSEEK_BASE_URL)
+        api_key = provider_env("CODEFORGE_DEEPSEEK_API_KEY", ("DEEPSEEK_API_KEY",))
         # DeepSeek 使用 Anthropic 兼容的 Messages API 协议。
         return AnthropicCompatibleModelClient(
             model=model,
@@ -222,7 +222,7 @@ def build_welcome(agent, model, host):
     |         (  o o  )                  |
     |         /   ^   \\                  |
     |        /|       |\\                 |
-    |              pico                  |
+    |              codeforge                  |
     |        local coding agent          |
     |       calm shell, ready for work   |
     |------------------------------------|
@@ -285,7 +285,7 @@ def build_welcome(agent, model, host):
 
 
 def build_agent(args):
-    """根据 CLI 参数装配出一个可运行的 Pico 实例。
+    """根据 CLI 参数装配出一个可运行的 CodeForge 实例。
 
     为什么存在：
     命令行参数只是字符串和开关，runtime 需要的是已经装配好的对象图：
@@ -294,7 +294,7 @@ def build_agent(args):
 
     输入 / 输出：
     - 输入：argparse 解析后的 args
-    - 输出：一个新的 Pico，或一个从旧 session 恢复出来的 Pico
+    - 输出：一个新的 CodeForge，或一个从旧 session 恢复出来的 CodeForge
 
     在 agent 链路里的位置：
     它是整个程序启动链路里最靠近 runtime 的装配点。main() 先调它，
@@ -304,16 +304,16 @@ def build_agent(args):
     1. 构建 WorkspaceContext（采集 cwd、git branch 等工作区快照）
     2. 加载项目级 .env 覆盖（load_project_env）
     3. 整理 secret 环境变量名单
-    4. 创建 SessionStore（持久化目录在 .pico/sessions）
+    4. 创建 SessionStore（持久化目录在 .codeforge/sessions）
     5. 根据 provider 构建对应的模型客户端
-    6. 若指定了 --resume，从已有 session 恢复；否则新建 Pico 实例
+    6. 若指定了 --resume，从已有 session 恢复；否则新建 CodeForge 实例
     """
     # 这里是 CLI 到 runtime 的装配点：
     # 先采集工作区快照和加载项目级环境，再整理 secret 名单、模型后端和 session。
     workspace = WorkspaceContext.build(args.cwd)
     load_project_env(workspace.repo_root)
     configured_secret_names = _configured_secret_names(args)
-    store = SessionStore(workspace.repo_root + "/.pico/sessions")
+    store = SessionStore(workspace.repo_root + "/.codeforge/sessions")
     model = _build_model_client(args)
     session_id = args.resume
     if session_id == "latest":
@@ -321,7 +321,7 @@ def build_agent(args):
         session_id = store.latest()
     if session_id:
         # 恢复已有 session：保留历史对话和 working memory。
-        return Pico.from_session(
+        return CodeForge.from_session(
             model_client=model,
             workspace=workspace,
             session_store=store,
@@ -332,7 +332,7 @@ def build_agent(args):
             secret_env_names=configured_secret_names,
         )
     # 全新启动：创建空白 session。
-    return Pico(
+    return CodeForge(
         model_client=model,
         workspace=workspace,
         session_store=store,
@@ -361,7 +361,7 @@ def build_arg_parser():
     parser.add_argument(
         "--model",
         default=None,
-        help="Model name override. Defaults to qwen3.5:4b for Ollama, PICO_OPENAI_MODEL for openai, PICO_ANTHROPIC_MODEL for anthropic, and PICO_DEEPSEEK_MODEL for deepseek when set.",
+        help="Model name override. Defaults to qwen3.5:4b for Ollama, CODEFORGE_OPENAI_MODEL for openai, CODEFORGE_ANTHROPIC_MODEL for anthropic, and CODEFORGE_DEEPSEEK_MODEL for deepseek when set.",
     )
     parser.add_argument("--host", default=DEFAULT_OLLAMA_HOST, help="Ollama server URL.")
     # --base-url 覆盖默认的 API 网关地址，适用于 openai / anthropic / deepseek。
@@ -389,7 +389,7 @@ def build_arg_parser():
 
 
 def main(argv=None):
-    """pico 的主入口函数。
+    """codeforge 的主入口函数。
 
     启动流程：
     1. 解析命令行参数
@@ -424,7 +424,7 @@ def main(argv=None):
         # 每次读取一条用户输入，交给同一个 agent，
         # 因此 session history 和 working memory 会跨轮延续。
         try:
-            user_input = input("\npico> ").strip()
+            user_input = input("\ncodeforge> ").strip()
         except (EOFError, KeyboardInterrupt):
             # Ctrl+D 或 Ctrl+C 优雅退出。
             print("")

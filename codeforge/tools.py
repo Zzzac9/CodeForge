@@ -321,10 +321,10 @@ def tool_delegate(agent, args):
     if not task:
         raise ValueError("task must not be empty")
 
-    from .runtime import Pico
+    from .runtime import CodeForge
 
     # 创建一个只读子 agent，共享模型、工作区、session store 和 run store
-    child = Pico(
+    child = CodeForge(
         model_client=agent.model_client,
         workspace=agent.workspace,
         session_store=agent.session_store,

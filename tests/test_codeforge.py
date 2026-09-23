@@ -5,8 +5,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pico as mini_pkg
-from pico import (
+import codeforge as mini_pkg
+from codeforge import (
     AnthropicCompatibleModelClient,
     FakeModelClient,
     MiniAgent,
@@ -25,7 +25,7 @@ def build_workspace(tmp_path):
 
 def build_agent(tmp_path, outputs, **kwargs):
     workspace = build_workspace(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
+    store = SessionStore(tmp_path / ".codeforge" / "sessions")
     approval_policy = kwargs.pop("approval_policy", "auto")
     return MiniAgent(
         model_client=FakeModelClient(outputs),
@@ -256,13 +256,13 @@ def test_invalid_risky_tool_does_not_prompt_for_approval(tmp_path):
 
 def test_list_files_hides_internal_agent_state(tmp_path):
     agent = build_agent(tmp_path, [])
-    (tmp_path / ".pico").mkdir(exist_ok=True)
+    (tmp_path / ".codeforge").mkdir(exist_ok=True)
     (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "hello.txt").write_text("hi\n", encoding="utf-8")
 
     result = agent.run_tool("list_files", {})
 
-    assert ".pico" not in result
+    assert ".codeforge" not in result
     assert ".git" not in result
     assert "[F] hello.txt" in result
 
@@ -291,7 +291,7 @@ def test_welcome_screen_keeps_box_shape_for_long_paths(tmp_path):
     assert "(  o o  )" in welcome
     assert "MINI-CODING-AGENT" not in welcome
     assert "MINI CODING AGENT" not in welcome
-    assert "pico" in welcome
+    assert "codeforge" in welcome
     assert "local coding agent" in welcome
     assert "// READY" not in welcome
     assert "SLASH" not in welcome
@@ -376,7 +376,7 @@ def test_openai_compatible_client_posts_expected_responses_payload():
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
     assert captured["headers"]["Content-type"] == "application/json"
     assert captured["headers"]["Accept"] == "application/json"
-    assert captured["headers"]["User-agent"] == "pico/0.1"
+    assert captured["headers"]["User-agent"] == "codeforge/0.1"
     assert captured["body"] == {
         "model": "right.codes/codex-mini",
         "input": [
@@ -651,9 +651,9 @@ def test_build_agent_uses_openai_provider_and_model_override(tmp_path):
         clear=False,
     ):
         with patch(
-            "pico.cli.OllamaModelClient",
+            "codeforge.cli.OllamaModelClient",
             side_effect=AssertionError("ollama client should not be used"),
-        ), patch("pico.cli.OpenAICompatibleModelClient") as mock_openai:
+        ), patch("codeforge.cli.OpenAICompatibleModelClient") as mock_openai:
             fake_client = mock_openai.return_value
             agent = mini_pkg.build_agent(args)
 
@@ -712,12 +712,12 @@ def test_build_agent_uses_anthropic_provider_and_openai_key_fallback(tmp_path):
         clear=True,
     ):
         with patch(
-            "pico.cli.OllamaModelClient",
+            "codeforge.cli.OllamaModelClient",
             side_effect=AssertionError("ollama client should not be used"),
         ), patch(
-            "pico.cli.OpenAICompatibleModelClient",
+            "codeforge.cli.OpenAICompatibleModelClient",
             side_effect=AssertionError("openai client should not be used"),
-        ), patch("pico.cli.AnthropicCompatibleModelClient") as mock_anthropic:
+        ), patch("codeforge.cli.AnthropicCompatibleModelClient") as mock_anthropic:
             fake_client = mock_anthropic.return_value
             agent = mini_pkg.build_agent(args)
 
@@ -737,7 +737,7 @@ def test_build_agent_uses_anthropic_default_model_when_env_is_missing(tmp_path):
         clear=False,
     ):
         os.environ.pop("ANTHROPIC_MODEL", None)
-        with patch("pico.cli.AnthropicCompatibleModelClient") as mock_anthropic:
+        with patch("codeforge.cli.AnthropicCompatibleModelClient") as mock_anthropic:
             mini_pkg.build_agent(args)
 
     assert mock_anthropic.call_args.kwargs["model"] == "claude-sonnet-4-6"
@@ -747,9 +747,9 @@ def test_build_agent_uses_deepseek_provider_and_env_configuration(tmp_path):
     (tmp_path / ".env").write_text(
         "\n".join(
             [
-                "PICO_DEEPSEEK_API_BASE=https://api.deepseek.com/anthropic",
-                "PICO_DEEPSEEK_API_KEY=sk-project-deepseek",
-                "PICO_DEEPSEEK_MODEL=deepseek-v4-pro",
+                "CODEFORGE_DEEPSEEK_API_BASE=https://api.deepseek.com/anthropic",
+                "CODEFORGE_DEEPSEEK_API_KEY=sk-project-deepseek",
+                "CODEFORGE_DEEPSEEK_MODEL=deepseek-v4-pro",
             ]
         )
         + "\n",
@@ -788,12 +788,12 @@ def test_build_agent_uses_deepseek_provider_and_env_configuration(tmp_path):
         clear=True,
     ):
         with patch(
-            "pico.cli.OllamaModelClient",
+            "codeforge.cli.OllamaModelClient",
             side_effect=AssertionError("ollama client should not be used"),
         ), patch(
-            "pico.cli.OpenAICompatibleModelClient",
+            "codeforge.cli.OpenAICompatibleModelClient",
             side_effect=AssertionError("openai client should not be used"),
-        ), patch("pico.cli.AnthropicCompatibleModelClient") as mock_anthropic:
+        ), patch("codeforge.cli.AnthropicCompatibleModelClient") as mock_anthropic:
             fake_client = mock_anthropic.return_value
             agent = mini_pkg.build_agent(args)
 
@@ -808,7 +808,7 @@ def test_build_agent_uses_deepseek_default_model_when_env_is_missing(tmp_path):
     args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "deepseek"])
 
     with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-deepseek"}, clear=True):
-        with patch("pico.cli.AnthropicCompatibleModelClient") as mock_anthropic:
+        with patch("codeforge.cli.AnthropicCompatibleModelClient") as mock_anthropic:
             mini_pkg.build_agent(args)
 
     assert mock_anthropic.call_args.kwargs["model"] == "deepseek-v4-pro"
@@ -827,9 +827,9 @@ def test_build_agent_uses_openai_provider_by_default(tmp_path):
         clear=False,
     ):
         with patch(
-            "pico.cli.OllamaModelClient",
+            "codeforge.cli.OllamaModelClient",
             side_effect=AssertionError("ollama client should not be used"),
-        ), patch("pico.cli.OpenAICompatibleModelClient") as mock_openai:
+        ), patch("codeforge.cli.OpenAICompatibleModelClient") as mock_openai:
             fake_client = mock_openai.return_value
             agent = mini_pkg.build_agent(args)
 
@@ -852,7 +852,7 @@ def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
 
     assert agent.ask("Do the thing") == "Finished."
 
-    runs_root = tmp_path / ".pico" / "runs"
+    runs_root = tmp_path / ".codeforge" / "runs"
     run_dirs = [path for path in runs_root.iterdir() if path.is_dir()]
     assert len(run_dirs) == 1
 
@@ -891,7 +891,7 @@ def test_trace_and_report_redact_secret_env_values(tmp_path):
 
         assert agent.ask("Mask the secret") == "Masked."
 
-    runs_root = tmp_path / ".pico" / "runs"
+    runs_root = tmp_path / ".codeforge" / "runs"
     run_dirs = [path for path in runs_root.iterdir() if path.is_dir()]
     assert len(run_dirs) == 1
 
@@ -1287,7 +1287,7 @@ def test_freshness_mismatch_creates_checkpoint_before_model_completion(tmp_path)
 
 def test_runtime_identity_persists_key_execution_metadata(tmp_path):
     workspace = build_workspace(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
+    store = SessionStore(tmp_path / ".codeforge" / "sessions")
     agent = MiniAgent(
         model_client=FakeModelClient(["<final>Done.</final>"]),
         workspace=workspace,
@@ -1414,7 +1414,7 @@ def test_explicit_memory_promotion_persists_durable_memory_topics(tmp_path):
         tmp_path,
         [
             "<final>Project convention: Use constrained tools instead of guessing.\n"
-            "Project convention: Preserve local agent state under .pico/.\n"
+            "Project convention: Preserve local agent state under .codeforge/.\n"
             "Decision: Keep durable memory topic-based and lightweight.</final>",
         ],
     )
@@ -1426,9 +1426,9 @@ def test_explicit_memory_promotion_persists_durable_memory_topics(tmp_path):
 
     assert "Project convention:" in answer
 
-    index_path = tmp_path / ".pico" / "memory" / "MEMORY.md"
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
-    decisions_path = tmp_path / ".pico" / "memory" / "topics" / "key-decisions.md"
+    index_path = tmp_path / ".codeforge" / "memory" / "MEMORY.md"
+    conventions_path = tmp_path / ".codeforge" / "memory" / "topics" / "project-conventions.md"
+    decisions_path = tmp_path / ".codeforge" / "memory" / "topics" / "key-decisions.md"
     report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
 
     assert index_path.exists()
@@ -1439,7 +1439,7 @@ def test_explicit_memory_promotion_persists_durable_memory_topics(tmp_path):
     assert "Keep durable memory topic-based and lightweight." in decisions_path.read_text(encoding="utf-8")
     assert report["durable_promotions"] == [
         "project-conventions: Use constrained tools instead of guessing.",
-        "project-conventions: Preserve local agent state under .pico/.",
+        "project-conventions: Preserve local agent state under .codeforge/.",
         "key-decisions: Keep durable memory topic-based and lightweight.",
     ]
 
@@ -1457,8 +1457,8 @@ def test_explicit_memory_promotion_supports_chinese_intent_and_labels(tmp_path):
 
     assert "项目约定：" in answer
 
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
-    decisions_path = tmp_path / ".pico" / "memory" / "topics" / "key-decisions.md"
+    conventions_path = tmp_path / ".codeforge" / "memory" / "topics" / "project-conventions.md"
+    decisions_path = tmp_path / ".codeforge" / "memory" / "topics" / "key-decisions.md"
 
     assert "优先使用受约束工具，不要靠猜。" in conventions_path.read_text(encoding="utf-8")
     assert "持久记忆保持轻量、按 topic 管理。" in decisions_path.read_text(encoding="utf-8")
@@ -1478,8 +1478,8 @@ def test_explicit_memory_promotion_rejects_secret_shaped_and_transient_lines(tmp
     agent.ask("Capture these stable facts into durable memory.")
 
     report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
-    dependency_path = tmp_path / ".pico" / "memory" / "topics" / "dependency-facts.md"
+    conventions_path = tmp_path / ".codeforge" / "memory" / "topics" / "project-conventions.md"
+    dependency_path = tmp_path / ".codeforge" / "memory" / "topics" / "dependency-facts.md"
 
     assert report["durable_promotions"] == [
         "project-conventions: Use constrained tools instead of guessing.",
@@ -1505,7 +1505,7 @@ def test_explicit_memory_promotion_supersedes_matching_durable_fact(tmp_path):
     assert agent.ask("Capture this stable dependency fact into durable memory.") == "Dependency: Python runtime is 3.11."
     assert agent.ask("Save the updated dependency fact into durable memory.") == "Dependency: Python runtime is 3.12."
 
-    dependency_path = tmp_path / ".pico" / "memory" / "topics" / "dependency-facts.md"
+    dependency_path = tmp_path / ".codeforge" / "memory" / "topics" / "dependency-facts.md"
     report = json.loads(agent.run_store.report_path(agent.current_task_state).read_text(encoding="utf-8"))
     text = dependency_path.read_text(encoding="utf-8")
 
@@ -1528,7 +1528,7 @@ def test_explicit_memory_promotion_dedupes_duplicate_durable_note(tmp_path):
     agent.ask("Capture the stable fact into durable memory.")
     agent.ask("Capture the stable fact into durable memory again.")
 
-    conventions_path = tmp_path / ".pico" / "memory" / "topics" / "project-conventions.md"
+    conventions_path = tmp_path / ".codeforge" / "memory" / "topics" / "project-conventions.md"
     text = conventions_path.read_text(encoding="utf-8")
 
     assert text.count("Use constrained tools instead of guessing.") == 1
@@ -1546,7 +1546,7 @@ def test_agent_records_model_cache_metadata_in_last_prompt_metadata(tmp_path):
             return super().complete(prompt, max_new_tokens, **kwargs)
 
     workspace = build_workspace(tmp_path)
-    store = SessionStore(tmp_path / ".pico" / "sessions")
+    store = SessionStore(tmp_path / ".codeforge" / "sessions")
     agent = MiniAgent(
         model_client=CacheAwareFakeModelClient(["<final>Done.</final>"]),
         workspace=workspace,
@@ -1592,7 +1592,7 @@ def test_public_api_exports_resolve_through_package_path():
     assert OllamaModelClient is not None
     assert SessionStore is not None
     assert WorkspaceContext is not None
-    assert Path(mini_pkg.__file__).as_posix().endswith("/pico/__init__.py")
+    assert Path(mini_pkg.__file__).as_posix().endswith("/codeforge/__init__.py")
 
 
 def test_reviewer_skeleton_docs_exist():
@@ -1621,7 +1621,7 @@ def test_package_import_surface_includes_cli_entrypoints():
 
 def test_module_execution_help_works():
     result = subprocess.run(
-        [sys.executable, "-m", "pico", "--help"],
+        [sys.executable, "-m", "codeforge", "--help"],
         capture_output=True,
         text=True,
     )
