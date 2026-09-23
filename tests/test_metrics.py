@@ -53,7 +53,7 @@ def test_provider_profile_loads_project_env_before_reading_deepseek_config(tmp_p
     assert profile["status"] == "ready"
     assert profile["api_key"] == "sk-project-deepseek"
     assert profile["model"] == "deepseek-v4-pro"
-    assert profile["base_url"] == "https://api.deepseek.com/anthropic"
+    assert profile["base_url"] == "https://api.deepseek.com"
 
 
 def test_run_memory_ablation_v2_writes_expected_artifact(tmp_path):

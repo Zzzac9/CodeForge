@@ -8,7 +8,7 @@ CodeForge 是一个面向本地代码仓库的轻量级 Coding Agent Harness。
 
 ## 核心特性
 
-- **多模型后端**：支持 Ollama、OpenAI-compatible、Anthropic-compatible 与 DeepSeek。
+- **统一模型接口**：只保留一套 OpenAI-compatible Chat Completions 协议，通过 `base_url / api_key / model` 切换兼容模型服务。
 - **受约束工具系统**：7 个显式注册工具，带参数校验、风险分级和审批策略。
 - **Context Engineering**：按 section 管理 Prompt 预算，超限时分层压缩，当前请求始终保留。
 - **结构化记忆**：工作记忆、文件摘要、episodic notes 与持久记忆分层管理。
@@ -18,20 +18,6 @@ CodeForge 是一个面向本地代码仓库的轻量级 Coding Agent Harness。
 - **完整审计**：每次运行生成 task state、trace 与 report，便于调试和回放。
 - **本地优先**：状态全部保存在仓库本地，不依赖数据库或额外服务。
 - **轻依赖**：核心运行时仅使用 Python 标准库。
-
-## 运行界面
-
-CLI 帮助：
-
-![CodeForge CLI help](assets/screenshots/codeforge-help.png)
-
-启动界面：
-
-![CodeForge start](assets/screenshots/codeforge-start.png)
-
-交互模式：
-
-![CodeForge REPL](assets/screenshots/codeforge-repl.png)
 
 ## 架构概览
 
@@ -82,7 +68,6 @@ CodeForge Runtime
 
 - Python 3.10+
 - Git（建议）
-- 若使用 Ollama，需要本地 Ollama 服务
 
 ### 2. 安装
 
@@ -107,36 +92,21 @@ python -m codeforge
 
 ### 3. 配置模型
 
-复制 `.env.example` 为 `.env`，只填写你实际使用的 provider。
-
-当前默认 provider 为 **DeepSeek**：
+CodeForge 不再按 provider 维护多套协议，只使用一套 **OpenAI-compatible Chat Completions** 接口。切换模型服务只需要改三个值：
 
 ```env
-CODEFORGE_DEEPSEEK_API_BASE=https://api.deepseek.com/anthropic
-CODEFORGE_DEEPSEEK_API_KEY=your-api-key
-CODEFORGE_DEEPSEEK_MODEL=deepseek-v4-pro
+CODEFORGE_API_BASE=https://api.deepseek.com
+CODEFORGE_API_KEY=your-api-key
+CODEFORGE_MODEL=deepseek-v4-pro
+CODEFORGE_PROMPT_CACHE_MODE=auto
 ```
 
-OpenAI-compatible：
-
-```env
-CODEFORGE_OPENAI_API_BASE=https://your-api.example/v1
-CODEFORGE_OPENAI_API_KEY=your-api-key
-CODEFORGE_OPENAI_MODEL=gpt-5.4
-```
-
-Anthropic-compatible：
-
-```env
-CODEFORGE_ANTHROPIC_API_BASE=https://www.right.codes/claude/v1
-CODEFORGE_ANTHROPIC_API_KEY=your-api-key
-CODEFORGE_ANTHROPIC_MODEL=claude-sonnet-4-6
-```
+例如切换到其他支持 Chat Completions API 的 OpenAI-compatible endpoint，只需要替换 `API_BASE`、`API_KEY` 和 `MODEL`。Runtime、Tool Calling、Memory、Checkpoint 与 Trace 都不需要变化。
 
 配置优先级：
 
 ```text
-显式 CLI 参数 > .env 中的 CODEFORGE_* 变量 > 兼容环境变量 > 代码默认值
+显式 CLI 参数 > .env 中的 CODEFORGE_* 变量 > 兼容旧环境变量 > 代码默认值
 ```
 
 ## 常用启动方式
@@ -147,20 +117,11 @@ CODEFORGE_ANTHROPIC_MODEL=claude-sonnet-4-6
 codeforge
 ```
 
-指定模型后端：
+临时覆盖模型或 API 地址：
 
 ```bash
-codeforge --provider openai
-codeforge --provider anthropic
-codeforge --provider deepseek
-```
-
-使用本地 Ollama：
-
-```bash
-ollama serve
-ollama pull qwen3.5:4b
-codeforge --provider ollama --model qwen3.5:4b
+codeforge --model deepseek-v4-pro
+codeforge --base-url https://api.deepseek.com
 ```
 
 指定工作目录：
@@ -310,23 +271,23 @@ CodeForge 的安全边界主要包括：
 
 这使一次 Agent 运行既能继续，也能在结束后被复盘。
 
-## 模型后端
+## 模型接口与 Prompt Cache
 
-| Provider | 接口 | Prompt Cache |
-|---|---|---|
-| Ollama | Ollama native | 否 |
-| OpenAI-compatible | Responses API | 支持的后端可用 |
-| Anthropic-compatible | Messages API | 当前未接入 |
-| DeepSeek | Anthropic-compatible | 当前未接入 |
-| FakeModelClient | 内存脚本 | 测试 / Benchmark 使用 |
-
-所有真实模型后端都被适配为统一的：
+生产路径只保留一个 `OpenAICompatibleModelClient`，使用 OpenAI-compatible Chat Completions 请求格式。`FakeModelClient` 仅用于测试和 Benchmark。
 
 ```python
 complete(prompt, max_new_tokens, ...) -> str
 ```
 
-Runtime 不需要关心底层 HTTP、SSE 或不同 provider 的响应格式。
+切换 DeepSeek、OpenAI 或其他兼容 endpoint 时，只替换 `base_url / api_key / model`，Runtime 不再维护 provider 分支。Chat Completions API 的原生 `function_call` 会被统一转换成 CodeForge 内部的工具调用格式，因此工具审批、参数校验、Trace 和 Memory 链路保持不变。
+
+Prompt Cache 采用两层策略：
+
+- **稳定前缀**：规则、工具签名与工作区事实尽量保持在 Prompt 前部，Prefix Hash 作为缓存身份记录到 Trace。
+- **服务端缓存**：默认不发送厂商专用缓存字段，依赖兼容服务自身的 Prompt / Context Cache；DeepSeek 会按重复前缀自动缓存。对明确支持 `prompt_cache_key` 的 endpoint，可手动切到 `explicit` 模式。
+- **真实命中统计**：统一解析 `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`，并兼容 `prompt_cache_hit_tokens / prompt_cache_miss_tokens`，把 `cached_tokens`、`cache_hit` 和缓存策略写入运行元数据。
+
+因此这里的 Prompt Cache 不是 CodeForge 在本地伪造 KV Cache，而是 **Harness 对服务端 Prompt/Context Cache 的稳定前缀优化、能力适配与命中观测**。
 
 ## 项目结构
 
@@ -363,7 +324,7 @@ assets/screenshots/      # README 截图
 python -m pytest -q
 ```
 
-项目内置固定 Benchmark 与指标框架，覆盖工具恢复、路径边界、重复读取、上下文压缩、记忆依赖、Checkpoint/Resume、安全场景以及多 provider 对照实验。
+项目内置固定 Benchmark 与指标框架，覆盖工具恢复、路径边界、重复读取、上下文压缩、记忆依赖、Checkpoint/Resume、安全场景以及不同模型配置的回归对比。
 
 Benchmark 使用隔离的 fixture workspace 与 verifier 来判断最终产物，而不是只看模型有没有返回“完成”。
 

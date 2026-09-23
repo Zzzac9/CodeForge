@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "codeforge"
 version = "0.1.0"
-description = "Small local coding agent for Ollama, OpenAI-compatible, Anthropic-compatible, and DeepSeek models"
+description = "Local coding agent harness using a unified OpenAI-compatible Chat Completions model interface"
 requires-python = ">=3.10"
 dependencies = []
 

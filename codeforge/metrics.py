@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .config import load_project_env, provider_env
 from .evaluator import run_fixed_benchmark
-from .models import AnthropicCompatibleModelClient, FakeModelClient, OpenAICompatibleModelClient
+from .models import FakeModelClient, OpenAICompatibleModelClient
 from .runtime import CodeForge, SessionStore
 from .workspace import WorkspaceContext
 
@@ -694,25 +694,24 @@ def _provider_profile(provider):
         api_key = provider_env("CODEFORGE_DEEPSEEK_API_KEY", ("DEEPSEEK_API_KEY",))
         if not api_key:
             return {"provider": provider, "status": "blocked", "reason": "CODEFORGE_DEEPSEEK_API_KEY or DEEPSEEK_API_KEY missing"}
+        base_url = provider_env(
+            "CODEFORGE_DEEPSEEK_API_BASE",
+            ("DEEPSEEK_API_BASE",),
+            "https://api.deepseek.com",
+        ).rstrip("/")
+        if base_url.endswith("/anthropic"):
+            base_url = base_url[:-len("/anthropic")]
         return {
             "provider": provider,
             "status": "ready",
             "model": provider_env("CODEFORGE_DEEPSEEK_MODEL", ("DEEPSEEK_MODEL",), "deepseek-v4-pro"),
-            "base_url": provider_env("CODEFORGE_DEEPSEEK_API_BASE", ("DEEPSEEK_API_BASE",), "https://api.deepseek.com/anthropic"),
+            "base_url": base_url,
             "api_key": api_key,
         }
-    api_key = provider_env(
-        "CODEFORGE_ANTHROPIC_API_KEY",
-        ("ANTHROPIC_API_KEY", "CODEFORGE_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "CODEFORGE_OPENAI_API_KEY", "OPENAI_API_KEY"),
-    )
-    if not api_key:
-        return {"provider": "claude", "status": "blocked", "reason": "CODEFORGE_ANTHROPIC_API_KEY or ANTHROPIC_API_KEY missing"}
     return {
-        "provider": "claude",
-        "status": "ready",
-        "model": provider_env("CODEFORGE_ANTHROPIC_MODEL", ("ANTHROPIC_MODEL",), "claude-sonnet-4-6"),
-        "base_url": provider_env("CODEFORGE_ANTHROPIC_API_BASE", ("ANTHROPIC_API_BASE",), "https://www.right.codes/claude/v1"),
-        "api_key": api_key,
+        "provider": provider,
+        "status": "blocked",
+        "reason": "unsupported profile: only OpenAI-compatible GPT and DeepSeek profiles are defined",
     }
 
 
@@ -729,7 +728,7 @@ def _make_provider_client(provider):
             temperature=0.0,
             timeout=timeout,
         )
-    return AnthropicCompatibleModelClient(
+    return OpenAICompatibleModelClient(
         model=profile["model"],
         base_url=profile["base_url"],
         api_key=profile["api_key"],
@@ -750,7 +749,7 @@ def run_provider_experiments(benchmark_path, workspace_root, artifact_root, max_
     workspace_root = Path(workspace_root)
     artifact_root = Path(artifact_root)
     providers = []
-    for provider_name in ("gpt", "claude", "deepseek"):
+    for provider_name in ("gpt", "deepseek"):
         profile = _provider_profile(provider_name)
         if profile["status"] != "ready":
             providers.append(profile)
@@ -768,7 +767,7 @@ def run_provider_experiments(benchmark_path, workspace_root, artifact_root, max_
         else:
             def factory(task, workspace, profile=profile):
                 del task, workspace
-                return AnthropicCompatibleModelClient(
+                return OpenAICompatibleModelClient(
                     model=profile["model"],
                     base_url=profile["base_url"],
                     api_key=profile["api_key"],

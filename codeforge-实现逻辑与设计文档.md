@@ -41,7 +41,7 @@ codeforge/
 ├── __main__.py          # python -m codeforge 入口 → 调 cli.main()
 ├── cli.py               # 命令行解析 + REPL/one-shot 主循环
 ├── config.py            # .env 文件加载 + 环境变量优先级链
-├── models.py            # 4 种模型后端的 HTTP 适配层
+├── models.py            # 统一 OpenAI-compatible Chat Completions 模型适配层
 ├── runtime.py           # 核心 agent 控制循环 (CodeForge 类, 1349 行)
 ├── tools.py             # 7 个工具的定义、校验、执行
 ├── workspace.py         # Git 工作区事实快照
@@ -57,7 +57,7 @@ codeforge/
 
 ```
 CodeForge (runtime.py)
-├── model_client      # models.py — Ollama / OpenAI / Anthropic / Fake
+├── model_client      # models.py — OpenAI-compatible / Fake(test)
 ├── workspace         # workspace.py — Git 事实 + 项目文档
 ├── session_store     # runtime.py:SessionStore — 会话持久化
 ├── run_store         # run_store.py — 运行工件落盘
@@ -80,13 +80,14 @@ __main__.py → cli.main()
         │
         ├── 1. 解析参数 (build_arg_parser)
         │     支持的参数：
-        │     ├── --provider (ollama/openai/anthropic/deepseek, 默认 deepseek)
         │     ├── --model (覆盖默认模型)
+        │     ├── --base-url (覆盖 OpenAI-compatible API 地址)
+        │     ├── --api-timeout (API 超时, 默认 300s)
+        │     ├── --prompt-cache-mode (auto/explicit/automatic/observe/off)
         │     ├── --approval (ask/auto/never, 默认 ask)
         │     ├── --max-steps (工具调用上限, 默认 6)
         │     ├── --max-new-tokens (输出 token 上限, 默认 512)
         │     ├── --temperature (采样温度, 默认 0.2)
-        │     ├── --top-p (top-p 采样, 默认 0.9)
         │     ├── --resume (恢复 session, 支持 "latest")
         │     ├── --cwd (工作目录, 默认 .)
         │     └── --secret-env-name (额外 secret 变量名)
@@ -99,7 +100,7 @@ __main__.py → cli.main()
         │     ├── 整理 secret 环境变量白名单
         │     ├── 创建 SessionStore (.codeforge/sessions/)
         │     ├── _build_model_client(args)
-        │     │     └── 根据 provider 创建对应的 HTTP client
+        │     │     └── 用 base_url / api_key / model 创建统一 OpenAI-compatible client
         │     └── 如果 --resume: CodeForge.from_session()
         │         否则: 新建 CodeForge()
         │
@@ -141,53 +142,60 @@ __main__.py → cli.main()
 
 ## 4. 模型后端适配
 
-`models.py` 把 4 种不同 provider 的 HTTP 接口差异抹平成统一的 `complete(prompt, max_new_tokens) → str` 接口。
+`models.py` 只保留一条生产调用路径：`OpenAICompatibleModelClient`。运行时不再维护 Ollama / Anthropic / DeepSeek 等 provider 分支，而是统一使用 OpenAI-compatible Chat Completions 协议，通过 `base_url`、`api_key` 和 `model` 切换兼容服务。
 
-### 4.1 四种客户端
+测试与 Benchmark 仍保留 `FakeModelClient`，用于注入确定性的模型输出。
 
-| 类 | 协议 | HTTP 端点 | Prompt Cache | 用途 |
-|---|---|---|---|---|
-| `OllamaModelClient` | Ollama native | `POST /api/generate` | ❌ | 本地模型 |
-| `OpenAICompatibleModelClient` | OpenAI Responses API | `POST /v1/responses` | ✅ (仅 openai.com / right.codes) | GPT 系 |
-| `AnthropicCompatibleModelClient` | Anthropic Messages API | `POST /v1/messages` | ❌ | Claude / DeepSeek |
-| `FakeModelClient` | 内存脚本 | - | ❌ | 测试/benchmark |
+### 4.1 统一客户端
 
-### 4.2 统一接口
+| 类 | 协议 | HTTP 端点 | 用途 |
+|---|---|---|---|
+| `OpenAICompatibleModelClient` | OpenAI-compatible Chat Completions | `POST /v1/chat/completions` | 真实模型调用 |
+| `FakeModelClient` | 内存脚本 | - | 单元测试 / Benchmark |
+
+统一接口：
 
 ```python
 def complete(self, prompt, max_new_tokens,
-             prompt_cache_key=None, prompt_cache_retention=None) -> str
+             prompt_cache_key=None,
+             prompt_cache_retention=None) -> str
 ```
 
-- runtime 不需要知道底层是 HTTP 还是内存、SSE 还是 JSON
-- prompt cache 参数在 `supports_prompt_cache=True` 时才实际发送
-- `last_completion_metadata` 记录 usage / cached_tokens 供上报
+Runtime 只依赖这个文本接口，不关心底层模型品牌。
 
-### 4.3 Ollama 客户端
+### 4.2 Prompt Cache 策略
 
-- 发送 `model` + `prompt` + `options`（num_predict, temperature, top_p）
-- 返回 `response` 字段
-- 错误处理：HTTP 错误 + Ollama 业务错误
+CodeForge 不在本地保存模型 KV Cache，而是对服务端 Prompt / Context Cache 做三件事：
 
-### 4.4 OpenAI 兼容客户端
+1. **稳定前缀**：把规则、工具签名、工作区事实等相对稳定的信息放在 Prompt 前部。
+2. **能力适配**：根据 endpoint 选择显式缓存或自动缓存策略。
+3. **命中观测**：统一提取 usage 中的 cached token 信息并写入 Trace / Report。
 
-- 发送 `input` 数组格式的 message，支持 `prompt_cache_key` / `prompt_cache_retention`
-- **双格式响应解析**：
-  - **SSE** (`text/event-stream`)：逐行解析 `data:` 事件，支持 `response.output_text.delta`（增量）、`response.output_text.done`（完成）、`response.completed`（完整响应）
-  - **JSON**：直接解析 `output_text` / `output[].content[].text` / `choices[].message.content`
-- 3 次重试 + 指数退避（仅 5xx 错误）
-- 从 usage 中提取 `cached_tokens` 做缓存命中统计
+`prompt_cache_mode=auto` 时：
 
-### 4.5 Anthropic 兼容客户端
+| Endpoint | 策略 | 行为 |
+|---|---|---|
+| OpenAI 官方 | `automatic` | 默认依赖服务端 Prompt Cache，并从 usage 读取 cached tokens |
+| DeepSeek 官方 | `automatic` | 不发送厂商专用缓存字段，依赖相同前缀触发服务端 Context Cache |
+| 其他兼容 endpoint | `observe` | 不假设缓存能力，仅观察 usage 是否返回缓存字段 |
 
-- 发送 `messages` 数组格式，带 `x-api-key` 和 `anthropic-version: 2023-06-01` 头
-- 从 `content` 数组中提取 `text` block
-- **特殊处理 DeepSeek**：DeepSeek 的 Anthropic 兼容接口会自动把 `<tool>` XML 转为 `tool_use` content block，客户端将其还原为 `<tool>` XML 格式
-- 3 次重试 + 指数退避
+`_extract_usage_cache_details()` 同时兼容：
+- `input_tokens_details.cached_tokens`
+- `prompt_tokens_details.cached_tokens`
+- `prompt_cache_hit_tokens`
+- `prompt_cache_miss_tokens`
 
-### 4.6 Base URL 规范化
+因此 `cached_tokens`、`cache_hit`、`cache_usage_reported` 与 `prompt_cache_strategy` 可以统一进入运行元数据。
 
-`_normalize_versioned_base_url()` 确保所有兼容接口的 URL 都以 `/v1` 结尾。
+### 4.3 Chat Completions API 与 Tool Calling 适配
+
+客户端向 `/v1/chat/completions` 发送统一的 `model + messages + max_tokens` 请求，并把当前白名单工具渲染成 Chat Completions API 的 `function` tools。服务端返回 `tool_calls` 时，客户端会将第一个函数调用规范化为 CodeForge 现有的 `<tool>{...}</tool>` 内部格式，再交给 Runtime 的参数校验、审批、执行与 Trace 链路。
+
+这样模型协议可以统一，而 Harness 自己的工具治理逻辑不需要跟具体模型服务绑定。当前使用非流式 JSON 返回，并对 5xx / 网络异常进行重试。
+
+### 4.4 Base URL 规范化
+
+`_normalize_versioned_base_url()` 将配置地址规范化到 `/v1`。例如 `https://api.deepseek.com` 会请求 `https://api.deepseek.com/v1/chat/completions`。
 
 ---
 
@@ -199,7 +207,7 @@ def complete(self, prompt, max_new_tokens,
 
 ```
 CodeForge
-├── model_client        # 模型后端 (Ollama/OpenAI/Anthropic/Fake)
+├── model_client        # 模型后端 (OpenAI-compatible / Fake)
 ├── workspace           # WorkspaceContext — Git 事实 + 项目文档快照
 ├── session_store       # SessionStore — .codeforge/sessions/ 的 CRUD
 ├── run_store           # RunStore — .codeforge/runs/<run_id>/ 工件管理
@@ -750,7 +758,7 @@ CodeForge.redact_text(text)
 | `run_context_stress_matrix()` | 上下文压力矩阵测试 |
 | `run_security_experiment_suite()` | 10 个安全场景：路径逃逸、符号链接、审批拒绝等 |
 | `run_recovery_ablation_v2()` | 恢复能力消融实验 |
-| `run_provider_experiments()` | 真实模型多 provider 对比（GPT/Claude/DeepSeek） |
+| `run_provider_experiments()` | 同一 OpenAI-compatible 协议下的模型配置对比（GPT/DeepSeek） |
 
 ---
 
@@ -881,7 +889,7 @@ Secret 脱敏 (trace/report 自动打码)
 - 每段有预算 + 地板
 - 压缩顺序明确：相关记忆 → 历史 → 工作记忆 → 前缀
 - 当前请求永远不裁剪
-- **稳定前缀缓存**：前缀变化时才重建，其余时间复用同一 cache key
+- **稳定前缀缓存**：前缀变化时才重建；OpenAI 可复用显式 cache key，DeepSeek 等自动缓存后端复用相同 Prompt 前缀
 
 ### 15.5 Checkpoint 恢复
 
@@ -897,15 +905,11 @@ Secret 脱敏 (trace/report 自动打码)
 - 文件摘要带新鲜度校验（SHA-256）
 - 持久记忆用 Subject Key 去重，简单的文件系统存储
 
-### 15.7 模型无关
+### 15.7 协议统一、模型解耦
 
-通过 `models.py` 适配层抹平差异：
-- Ollama（本地）
-- OpenAI 兼容（GPT）
-- Anthropic 兼容（Claude / DeepSeek）
-- Fake（测试）
+真实模型调用统一收敛到 `OpenAICompatibleModelClient`，使用 OpenAI-compatible Chat Completions 协议；通过 `base_url / api_key / model` 切换兼容 endpoint。测试使用 `FakeModelClient`。
 
-所有 provider 暴露统一的 `complete(prompt) → str` 接口。
+Runtime 始终只依赖 `complete(prompt) → str` 接口，因此 Agent 控制循环、Tool Calling、Memory、Checkpoint 与 Trace 不与具体模型品牌绑定。
 
 ### 15.8 零外部依赖
 

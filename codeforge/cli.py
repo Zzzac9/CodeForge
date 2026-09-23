@@ -1,7 +1,7 @@
 """命令行入口。
 
 这个模块负责把"用户怎么启动 codeforge"翻译成 runtime 能理解的对象：
-解析参数、挑模型后端、构建工作区快照、恢复或新建 session，
+解析参数、构建统一模型接口、构建工作区快照、恢复或新建 session，
 最后进入 one-shot 或交互式循环。
 
 整体调用链：
@@ -17,7 +17,7 @@ import sys
 import textwrap
 
 from .config import load_project_env, provider_env
-from .models import AnthropicCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
+from .models import OpenAICompatibleModelClient
 from .runtime import CodeForge, SessionStore
 from .workspace import WorkspaceContext, middle
 
@@ -26,16 +26,11 @@ from .workspace import WorkspaceContext, middle
 # 防止 API key、token 等凭据意外泄露到日志或会话文件里。
 # 用户可通过 --secret-env-name 追加，或通过 CODEFORGE_SECRET_ENV_NAMES 环境变量扩展。
 DEFAULT_SECRET_ENV_NAMES = (
-    "CODEFORGE_OPENAI_API_KEY",
+    "CODEFORGE_API_KEY",
     "OPENAI_API_KEY",
-    "OPENAI_API_TOKEN",
-    "CODEFORGE_ANTHROPIC_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CODEFORGE_DEEPSEEK_API_KEY",
     "DEEPSEEK_API_KEY",
-    "CODEFORGE_RIGHT_CODES_API_KEY",
-    "RIGHT_CODES_API_KEY",
+    "CODEFORGE_OPENAI_API_KEY",
+    "CODEFORGE_DEEPSEEK_API_KEY",
     "GITHUB_PAT",
     "GH_PAT",
 )
@@ -63,57 +58,24 @@ HELP_DETAILS = textwrap.dedent(
 ).strip()
 
 
-# ---- 各 provider 的默认模型与 API 地址 ----
-# 这些常量仅在用户未通过 --model / --base-url / 环境变量显式指定时生效。
-DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"
-DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_OPENAI_MODEL = "gpt-5.4"
-DEFAULT_OPENAI_BASE_URL = "https://www.right.codes/codex/v1"
-DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
-DEFAULT_ANTHROPIC_BASE_URL = "https://www.right.codes/claude/v1"
-DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
-DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
-# 旧版项目名称为 mini-coding-agent，保留此环境变量名以兼容旧配置。
+# ---- 统一 OpenAI-compatible Chat Completions 模型配置 ----
+DEFAULT_MODEL = "deepseek-v4-pro"
+DEFAULT_API_BASE_URL = "https://api.deepseek.com"
+DEFAULT_API_TIMEOUT = 300
+DEFAULT_PROMPT_CACHE_MODE = "auto"
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
 SECRET_ENV_NAMES_VAR = "CODEFORGE_SECRET_ENV_NAMES"
 
 
-def _effective_model(args, provider):
-    """根据优先级解析最终使用的模型名称。
-
-    模型选择优先级（由高到低）：
-    1. 用户显式传入 --model 参数
-    2. provider 对应的环境变量（如 CODEFORGE_OPENAI_MODEL）
-    3. 代码里的默认值（如 DEFAULT_OPENAI_MODEL）
-
-    Args:
-        args: argparse 解析后的命名空间。
-        provider: 当前 provider 标识，如 "openai"、"anthropic"。
-
-    Returns:
-        str: 最终确定的模型名称。
-    """
+def _effective_model(args):
     explicit_model = getattr(args, "model", None)
     if explicit_model:
         return explicit_model
-    if provider == "openai":
-        model = provider_env("CODEFORGE_OPENAI_MODEL", ("OPENAI_MODEL",))
-        if model:
-            return model
-        return DEFAULT_OPENAI_MODEL
-    if provider == "anthropic":
-        model = provider_env("CODEFORGE_ANTHROPIC_MODEL", ("ANTHROPIC_MODEL",))
-        if model:
-            return model
-        return DEFAULT_ANTHROPIC_MODEL
-    if provider == "deepseek":
-        model = provider_env("CODEFORGE_DEEPSEEK_MODEL", ("DEEPSEEK_MODEL",))
-        if model:
-            return model
-        return DEFAULT_DEEPSEEK_MODEL
-    # 走到这里说明 provider 未被明确匹配（通常是 ollama），
-    # 直接回退到 Ollama 默认模型。
-    return DEFAULT_OLLAMA_MODEL
+    return provider_env(
+        "CODEFORGE_MODEL",
+        ("CODEFORGE_DEEPSEEK_MODEL", "DEEPSEEK_MODEL", "CODEFORGE_OPENAI_MODEL", "OPENAI_MODEL"),
+        DEFAULT_MODEL,
+    )
 
 
 def _configured_secret_names(args):
@@ -144,69 +106,27 @@ def _configured_secret_names(args):
 
 
 def _build_model_client(args):
-    """根据 CLI 参数创建对应的模型客户端实例。
-
-    CLI 只负责把 provider 选择翻译成具体 client。
-    真正的提示词格式、缓存支持、HTTP 协议差异，都封装在 models.py 里。
-
-    每个 provider 分支依次解析 model / base_url / api_key，然后构造对应 client：
-    - openai -> OpenAICompatibleModelClient（OpenAI 兼容协议）
-    - anthropic -> AnthropicCompatibleModelClient（Anthropic Messages API 兼容协议）
-    - deepseek -> AnthropicCompatibleModelClient（DeepSeek 也走 Anthropic 兼容协议）
-    - 其他 -> OllamaModelClient（本地 Ollama 服务）
-    """
-    provider = getattr(args, "provider", "openai")
-
-    if provider == "openai":
-        model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("CODEFORGE_OPENAI_API_BASE", ("OPENAI_API_BASE",), DEFAULT_OPENAI_BASE_URL)
-        api_key = provider_env("CODEFORGE_OPENAI_API_KEY", ("OPENAI_API_KEY",))
-        return OpenAICompatibleModelClient(
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            temperature=args.temperature,
-            timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
-        )
-    if provider == "anthropic":
-        model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("CODEFORGE_ANTHROPIC_API_BASE", ("ANTHROPIC_API_BASE",), DEFAULT_ANTHROPIC_BASE_URL)
-        # Anthropic provider 的 API key 有多个回退路径：
-        # 优先 CODEFORGE_ANTHROPIC_API_KEY，其次 ANTHROPIC_API_KEY，
-        # 再回退到 RIGHT_CODES / OPENAI 的 key（兼容共用网关场景）。
-        api_key = provider_env(
-            "CODEFORGE_ANTHROPIC_API_KEY",
-            ("ANTHROPIC_API_KEY", "CODEFORGE_RIGHT_CODES_API_KEY", "RIGHT_CODES_API_KEY", "CODEFORGE_OPENAI_API_KEY", "OPENAI_API_KEY"),
-        )
-        return AnthropicCompatibleModelClient(
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            temperature=args.temperature,
-            timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
-        )
-    if provider == "deepseek":
-        model = _effective_model(args, provider)
-        base_url = getattr(args, "base_url", None) or provider_env("CODEFORGE_DEEPSEEK_API_BASE", ("DEEPSEEK_API_BASE",), DEFAULT_DEEPSEEK_BASE_URL)
-        api_key = provider_env("CODEFORGE_DEEPSEEK_API_KEY", ("DEEPSEEK_API_KEY",))
-        # DeepSeek 使用 Anthropic 兼容的 Messages API 协议。
-        return AnthropicCompatibleModelClient(
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            temperature=args.temperature,
-            timeout=getattr(args, "openai_timeout", getattr(args, "ollama_timeout", 300)),
-        )
-
-    # 默认分支：ollama 或未识别的 provider，走本地 Ollama 服务。
-    model = _effective_model(args, provider)
-    host = getattr(args, "host", DEFAULT_OLLAMA_HOST)
-    return OllamaModelClient(
+    """Build the single OpenAI-compatible Chat Completions model client."""
+    model = _effective_model(args)
+    base_url = getattr(args, "base_url", None) or provider_env(
+        "CODEFORGE_API_BASE",
+        ("CODEFORGE_DEEPSEEK_API_BASE", "DEEPSEEK_API_BASE", "CODEFORGE_OPENAI_API_BASE", "OPENAI_API_BASE"),
+        DEFAULT_API_BASE_URL,
+    )
+    api_key = provider_env(
+        "CODEFORGE_API_KEY",
+        ("CODEFORGE_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY", "CODEFORGE_OPENAI_API_KEY", "OPENAI_API_KEY"),
+    )
+    cache_mode = getattr(args, "prompt_cache_mode", None) or provider_env(
+        "CODEFORGE_PROMPT_CACHE_MODE", (), DEFAULT_PROMPT_CACHE_MODE
+    )
+    return OpenAICompatibleModelClient(
         model=model,
-        host=host,
+        base_url=base_url,
+        api_key=api_key,
         temperature=args.temperature,
-        top_p=args.top_p,
-        timeout=args.ollama_timeout,
+        timeout=getattr(args, "api_timeout", DEFAULT_API_TIMEOUT),
+        prompt_cache_mode=cache_mode,
     )
 
 
@@ -305,7 +225,7 @@ def build_agent(args):
     2. 加载项目级 .env 覆盖（load_project_env）
     3. 整理 secret 环境变量名单
     4. 创建 SessionStore（持久化目录在 .codeforge/sessions）
-    5. 根据 provider 构建对应的模型客户端
+    5. 根据统一的 OpenAI-compatible 配置构建模型客户端
     6. 若指定了 --resume，从已有 session 恢复；否则新建 CodeForge 实例
     """
     # 这里是 CLI 到 runtime 的装配点：
@@ -344,47 +264,48 @@ def build_agent(args):
 
 
 def build_arg_parser():
-    """构建命令行参数解析器。
-
-    所有 CLI 参数在此集中定义，包括位置参数 prompt 以及
-    provider、model、session、approval 等可选参数。
-    """
+    """Build CLI arguments for the unified OpenAI-compatible model path."""
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Minimal coding agent for Ollama, OpenAI-compatible, Anthropic-compatible, or DeepSeek models.",
+        description="Local coding agent using one OpenAI-compatible Chat Completions model protocol.",
     )
-    # 位置参数：如果不传则进入交互 REPL 模式。
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
-    # --provider 决定走哪个模型后端，默认 openai。
-    parser.add_argument("--provider", choices=("ollama", "openai", "anthropic", "deepseek"), default="deepseek", help="Model backend to use.")
+    parser.add_argument("--model", default=None, help="Model name override.")
     parser.add_argument(
-        "--model",
+        "--base-url",
         default=None,
-        help="Model name override. Defaults to qwen3.5:4b for Ollama, CODEFORGE_OPENAI_MODEL for openai, CODEFORGE_ANTHROPIC_MODEL for anthropic, and CODEFORGE_DEEPSEEK_MODEL for deepseek when set.",
+        help="OpenAI-compatible API base URL, for example https://api.deepseek.com.",
     )
-    parser.add_argument("--host", default=DEFAULT_OLLAMA_HOST, help="Ollama server URL.")
-    # --base-url 覆盖默认的 API 网关地址，适用于 openai / anthropic / deepseek。
-    parser.add_argument("--base-url", default=None, help="Provider API base URL for openai, anthropic, or deepseek.")
-    parser.add_argument("--ollama-timeout", type=int, default=300, help="Ollama request timeout in seconds.")
-    parser.add_argument("--openai-timeout", type=int, default=300, help="OpenAI-compatible request timeout in seconds.")
-    # --resume 允许恢复之前的会话；传 "latest" 则自动选择最近的 session。
+    parser.add_argument(
+        "--api-timeout",
+        type=int,
+        default=DEFAULT_API_TIMEOUT,
+        help="Model API request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--prompt-cache-mode",
+        choices=("auto", "explicit", "automatic", "observe", "off"),
+        default=None,
+        help="Prompt cache strategy. auto detects OpenAI/DeepSeek behavior.",
+    )
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
-    # --approval 控制危险工具的执行策略：ask=每次询问, auto=自动批准, never=永不执行。
-    parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask", help="Approval policy for risky tools.")
+    parser.add_argument(
+        "--approval",
+        choices=("ask", "auto", "never"),
+        default="ask",
+        help="Approval policy for risky tools.",
+    )
     parser.add_argument(
         "--secret-env-name",
         dest="secret_env_names",
         action="append",
         default=[],
-        help="Extra environment variable names to treat as secrets for trace/report redaction.",
+        help="Extra environment variable names to redact from trace/report.",
     )
-    # --max-steps 限制单次请求中模型与工具之间的最大交互轮数。
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
-    # --max-new-tokens 限制模型每次响应的最大输出 token 数。
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
-    parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
-    parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature.")
     return parser
 
 
@@ -402,8 +323,8 @@ def main(argv=None):
     agent = build_agent(args)
 
     # 从已构建的 model_client 或 args 中提取 model 和 host 用于欢迎界面显示。
-    model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_OLLAMA_MODEL))
-    host = getattr(agent.model_client, "host", getattr(agent.model_client, "base_url", getattr(args, "host", DEFAULT_OLLAMA_HOST)))
+    model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_MODEL))
+    host = getattr(agent.model_client, "base_url", getattr(args, "base_url", DEFAULT_API_BASE_URL))
     print(build_welcome(agent, model=model, host=host))
 
     if args.prompt:

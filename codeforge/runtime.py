@@ -347,6 +347,36 @@ class CodeForge:
     def build_tools(self):
         return toolkit.build_tool_registry(self)
 
+    def model_tool_specs(self):
+        """Render the current tool registry as Chat Completions function tools."""
+        type_map = {"str": "string", "int": "integer", "float": "number", "bool": "boolean"}
+        rendered = []
+        for name, tool in self.tools.items():
+            properties = {}
+            required = []
+            for field, spec in tool["schema"].items():
+                raw = str(spec)
+                type_name, has_default, _ = raw.partition("=")
+                properties[field] = {"type": type_map.get(type_name.strip(), "string")}
+                if not has_default:
+                    required.append(field)
+            parameters = {
+                "type": "object",
+                "properties": properties,
+                "additionalProperties": False,
+            }
+            if required:
+                parameters["required"] = required
+            rendered.append(
+                {
+                    "type": "function",
+                    "name": name,
+                    "description": tool["description"],
+                    "parameters": parameters,
+                }
+            )
+        return rendered
+
     def tool_signature(self):
         payload = []
         for name in sorted(self.tools):
@@ -611,6 +641,7 @@ class CodeForge:
                 "workspace_changed": refresh["workspace_changed"],
                 "prefix_changed": refresh["prefix_changed"],
                 "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
+                "prompt_cache_strategy": getattr(self.model_client, "prompt_cache_strategy", "off"),
                 "resume_status": self.resume_state.get("status", CHECKPOINT_NONE_STATUS),
                 "stale_summary_invalidations": int(self.resume_state.get("stale_summary_invalidations", 0)),
                 "stale_paths": list(self.resume_state.get("stale_paths", [])),
@@ -944,11 +975,12 @@ class CodeForge:
                     "prompt_cache_key": prompt_metadata.get("prompt_cache_key"),
                 },
             )
-            prompt_cache_key = None
+            # Stable prefix hash is useful for every cache-aware backend.
+            # Only explicit-cache APIs receive vendor cache parameters; automatic
+            # caches such as DeepSeek only need the repeated prefix itself.
+            prompt_cache_key = prompt_metadata.get("prompt_cache_key")
             prompt_cache_retention = None
-            if getattr(self.model_client, "supports_prompt_cache", False):
-                # 只有后端明确支持时，才把稳定前缀的 hash 作为 cache key 发出去。
-                prompt_cache_key = prompt_metadata.get("prompt_cache_key")
+            if getattr(self.model_client, "uses_explicit_prompt_cache", False):
                 prompt_cache_retention = "in_memory"
 
             # 记录模型调用开始时间，用于统计本轮模型请求耗时
@@ -960,6 +992,7 @@ class CodeForge:
                 self.max_new_tokens,
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
+                tools=self.model_tool_specs(),
             )
 
             # 读取模型客户端留下的元数据，例如 usage、cached_tokens、cache_hit 等

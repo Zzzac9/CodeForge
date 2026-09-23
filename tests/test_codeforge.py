@@ -7,10 +7,8 @@ from unittest.mock import patch
 
 import codeforge as mini_pkg
 from codeforge import (
-    AnthropicCompatibleModelClient,
     FakeModelClient,
     MiniAgent,
-    OllamaModelClient,
     OpenAICompatibleModelClient,
     SessionStore,
     WorkspaceContext,
@@ -299,58 +297,20 @@ def test_welcome_screen_keeps_box_shape_for_long_paths(tmp_path):
     assert "commands: Commands:" not in welcome
 
 
-def test_ollama_client_posts_expected_payload():
+
+
+def test_openai_compatible_client_posts_expected_chat_payload():
     captured = {}
 
     class FakeResponse:
         def __enter__(self):
             return self
-
         def __exit__(self, exc_type, exc, tb):
             return False
-
         def read(self):
-            return json.dumps({"response": "<final>ok</final>"}).encode("utf-8")
-
-    def fake_urlopen(request, timeout):
-        captured["url"] = request.full_url
-        captured["timeout"] = timeout
-        captured["body"] = json.loads(request.data.decode("utf-8"))
-        return FakeResponse()
-
-    client = OllamaModelClient(
-        model="qwen3.5:4b",
-        host="http://127.0.0.1:11434",
-        temperature=0.2,
-        top_p=0.9,
-        timeout=30,
-    )
-
-    with patch("urllib.request.urlopen", fake_urlopen):
-        result = client.complete("hello", 42)
-
-    assert result == "<final>ok</final>"
-    assert captured["url"] == "http://127.0.0.1:11434/api/generate"
-    assert captured["timeout"] == 30
-    assert captured["body"]["model"] == "qwen3.5:4b"
-    assert captured["body"]["prompt"] == "hello"
-    assert captured["body"]["stream"] is False
-
-
-def test_openai_compatible_client_posts_expected_responses_payload():
-    captured = {}
-
-    class FakeResponse:
-        headers = {"Content-Type": "application/json"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps({"output_text": "<final>ok</final>"}).encode("utf-8")
+            return json.dumps({
+                "choices": [{"message": {"role": "assistant", "content": "<final>ok</final>"}}]
+            }).encode("utf-8")
 
     def fake_urlopen(request, timeout):
         captured["url"] = request.full_url
@@ -360,86 +320,62 @@ def test_openai_compatible_client_posts_expected_responses_payload():
         return FakeResponse()
 
     client = OpenAICompatibleModelClient(
-        model="right.codes/codex-mini",
-        base_url="https://right.codes/v1",
+        model="compatible-model",
+        base_url="https://example.com/v1",
         api_key="sk-test",
         temperature=0.2,
         timeout=30,
     )
-
     with patch("urllib.request.urlopen", fake_urlopen):
         result = client.complete("hello", 42)
 
     assert result == "<final>ok</final>"
-    assert captured["url"] == "https://right.codes/v1/responses"
+    assert captured["url"] == "https://example.com/v1/chat/completions"
     assert captured["timeout"] == 30
     assert captured["headers"]["Authorization"] == "Bearer sk-test"
-    assert captured["headers"]["Content-type"] == "application/json"
-    assert captured["headers"]["Accept"] == "application/json"
-    assert captured["headers"]["User-agent"] == "codeforge/0.1"
     assert captured["body"] == {
-        "model": "right.codes/codex-mini",
-        "input": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "hello",
-                    }
-                ],
-            }
-        ],
-        "max_output_tokens": 42,
+        "model": "compatible-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 42,
         "stream": False,
         "temperature": 0.2,
     }
 
 
-def test_openai_compatible_client_sends_prompt_cache_fields_and_records_usage():
+def test_explicit_prompt_cache_mode_sends_fields_and_records_usage():
     captured = {}
 
     class FakeResponse:
-        headers = {"Content-Type": "application/json"}
-
         def __enter__(self):
             return self
-
         def __exit__(self, exc_type, exc, tb):
             return False
-
         def read(self):
-            return json.dumps(
-                {
-                    "output_text": "<final>ok</final>",
-                    "usage": {
-                        "input_tokens": 2048,
-                        "input_tokens_details": {"cached_tokens": 1536},
-                        "output_tokens": 32,
-                        "total_tokens": 2080,
-                    },
-                }
-            ).encode("utf-8")
+            return json.dumps({
+                "choices": [{"message": {"role": "assistant", "content": "<final>ok</final>"}}],
+                "usage": {
+                    "prompt_tokens": 2048,
+                    "prompt_tokens_details": {"cached_tokens": 1536},
+                    "completion_tokens": 32,
+                    "total_tokens": 2080,
+                },
+            }).encode("utf-8")
 
     def fake_urlopen(request, timeout):
-        captured["url"] = request.full_url
-        captured["timeout"] = timeout
-        captured["headers"] = dict(request.headers)
         captured["body"] = json.loads(request.data.decode("utf-8"))
         return FakeResponse()
 
     client = OpenAICompatibleModelClient(
-        model="right.codes/codex-mini",
-        base_url="https://right.codes/v1",
+        model="compatible-model",
+        base_url="https://example.com/v1",
         api_key="sk-test",
         temperature=0.2,
         timeout=30,
+        prompt_cache_mode="explicit",
     )
-
     with patch("urllib.request.urlopen", fake_urlopen):
         result = client.complete(
-            "hello",
-            42,
+            "hello", 42,
             prompt_cache_key="prefix-hash-123",
             prompt_cache_retention="in_memory",
         )
@@ -451,393 +387,6 @@ def test_openai_compatible_client_sends_prompt_cache_fields_and_records_usage():
     assert client.last_completion_metadata["cached_tokens"] == 1536
     assert client.last_completion_metadata["cache_hit"] is True
     assert client.last_completion_metadata["input_tokens"] == 2048
-
-
-def test_openai_compatible_client_extracts_text_from_event_stream():
-    class FakeResponse:
-        headers = {"Content-Type": "text/event-stream"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return (
-                'data: {"type":"response.created","response":{"id":"resp_1","output":[]}}\n'
-                'data: {"type":"response.completed","response":{"output":[{"content":[{"text":"<final>stream ok</final>"}]}]}}\n'
-                "data: [DONE]\n"
-            ).encode("utf-8")
-
-    client = OpenAICompatibleModelClient(
-        model="right.codes/codex-mini",
-        base_url="https://right.codes/v1",
-        api_key="sk-test",
-        temperature=0.2,
-        timeout=30,
-    )
-
-    with patch("urllib.request.urlopen", return_value=FakeResponse()):
-        result = client.complete("hello", 42)
-
-    assert result == "<final>stream ok</final>"
-
-
-def test_openai_compatible_client_extracts_text_from_event_stream_deltas():
-    class FakeResponse:
-        headers = {"Content-Type": "text/event-stream"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return (
-                'event: response.output_text.delta\n'
-                'data: {"type":"response.output_text.delta","delta":"<final>"}\n'
-                'event: response.output_text.delta\n'
-                'data: {"type":"response.output_text.delta","delta":"OK"}\n'
-                'event: response.output_text.done\n'
-                'data: {"type":"response.output_text.done","text":"<final>OK</final>"}\n'
-                "data: [DONE]\n"
-            ).encode("utf-8")
-
-    client = OpenAICompatibleModelClient(
-        model="right.codes/codex-mini",
-        base_url="https://right.codes/v1",
-        api_key="sk-test",
-        temperature=0.2,
-        timeout=30,
-    )
-
-    with patch("urllib.request.urlopen", return_value=FakeResponse()):
-        result = client.complete("hello", 42)
-
-    assert result == "<final>OK</final>"
-
-
-def test_anthropic_compatible_client_posts_expected_messages_payload():
-    captured = {}
-
-    class FakeResponse:
-        headers = {"Content-Type": "application/json"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps(
-                {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "<final>ok</final>",
-                        }
-                    ]
-                }
-            ).encode("utf-8")
-
-    def fake_urlopen(request, timeout):
-        captured["url"] = request.full_url
-        captured["timeout"] = timeout
-        captured["headers"] = dict(request.headers)
-        captured["body"] = json.loads(request.data.decode("utf-8"))
-        return FakeResponse()
-
-    client = AnthropicCompatibleModelClient(
-        model="claude-sonnet-4-5-20250929",
-        base_url="https://www.right.codes/claude-aws/v1",
-        api_key="sk-test",
-        temperature=0.2,
-        timeout=30,
-    )
-
-    with patch("urllib.request.urlopen", fake_urlopen):
-        result = client.complete("hello", 42)
-
-    assert result == "<final>ok</final>"
-    assert captured["url"] == "https://www.right.codes/claude-aws/v1/messages"
-    assert captured["timeout"] == 30
-    assert captured["headers"]["X-api-key"] == "sk-test"
-    assert captured["headers"]["Anthropic-version"] == "2023-06-01"
-    assert captured["headers"]["Content-type"] == "application/json"
-    assert captured["body"] == {
-        "model": "claude-sonnet-4-5-20250929",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "hello",
-                    }
-                ],
-            }
-        ],
-        "max_tokens": 42,
-        "stream": False,
-        "temperature": 0.2,
-    }
-
-
-def test_anthropic_compatible_client_extracts_first_text_block():
-    class FakeResponse:
-        headers = {"Content-Type": "application/json"}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps(
-                {
-                    "content": [
-                        {"type": "thinking", "thinking": "hidden"},
-                        {"type": "text", "text": "<final>ok</final>"},
-                    ]
-                }
-            ).encode("utf-8")
-
-    client = AnthropicCompatibleModelClient(
-        model="claude-sonnet-4-5-20250929",
-        base_url="https://www.right.codes/claude-aws/v1",
-        api_key="sk-test",
-        temperature=0.2,
-        timeout=30,
-    )
-
-    with patch("urllib.request.urlopen", return_value=FakeResponse()):
-        result = client.complete("hello", 42)
-
-    assert result == "<final>ok</final>"
-
-
-def test_build_agent_uses_openai_provider_and_model_override(tmp_path):
-    args = type(
-        "Args",
-        (),
-        {
-            "cwd": str(tmp_path),
-            "provider": "openai",
-            "model": "override-model",
-            "base_url": None,
-            "host": "http://127.0.0.1:11434",
-            "ollama_timeout": 300,
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "resume": None,
-            "approval": "ask",
-            "secret_env_names": [],
-            "max_steps": 6,
-            "max_new_tokens": 512,
-        },
-    )()
-
-    with patch.dict(
-        os.environ,
-        {
-            "OPENAI_API_BASE": "https://www.right.codes/codex/v1",
-            "OPENAI_API_KEY": "sk-test",
-            "OPENAI_MODEL": "env-model",
-        },
-        clear=False,
-    ):
-        with patch(
-            "codeforge.cli.OllamaModelClient",
-            side_effect=AssertionError("ollama client should not be used"),
-        ), patch("codeforge.cli.OpenAICompatibleModelClient") as mock_openai:
-            fake_client = mock_openai.return_value
-            agent = mini_pkg.build_agent(args)
-
-    mock_openai.assert_called_once()
-    assert mock_openai.call_args.kwargs["model"] == "override-model"
-    assert mock_openai.call_args.kwargs["base_url"] == "https://www.right.codes/codex/v1"
-    assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
-    assert agent.model_client is fake_client
-
-
-def test_build_arg_parser_defaults_provider_to_openai(tmp_path):
-    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
-
-    assert args.provider == "openai"
-
-
-def test_build_arg_parser_accepts_anthropic_provider(tmp_path):
-    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "anthropic"])
-
-    assert args.provider == "anthropic"
-
-
-def test_build_arg_parser_accepts_deepseek_provider(tmp_path):
-    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "deepseek"])
-
-    assert args.provider == "deepseek"
-
-
-def test_build_agent_uses_anthropic_provider_and_openai_key_fallback(tmp_path):
-    args = type(
-        "Args",
-        (),
-        {
-            "cwd": str(tmp_path),
-            "provider": "anthropic",
-            "model": "claude-sonnet-4-5-20250929",
-            "base_url": None,
-            "host": "http://127.0.0.1:11434",
-            "ollama_timeout": 300,
-            "openai_timeout": 300,
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "resume": None,
-            "approval": "ask",
-            "secret_env_names": [],
-            "max_steps": 6,
-            "max_new_tokens": 512,
-        },
-    )()
-
-    with patch.dict(
-        os.environ,
-        {
-            "OPENAI_API_KEY": "sk-openai-fallback",
-        },
-        clear=True,
-    ):
-        with patch(
-            "codeforge.cli.OllamaModelClient",
-            side_effect=AssertionError("ollama client should not be used"),
-        ), patch(
-            "codeforge.cli.OpenAICompatibleModelClient",
-            side_effect=AssertionError("openai client should not be used"),
-        ), patch("codeforge.cli.AnthropicCompatibleModelClient") as mock_anthropic:
-            fake_client = mock_anthropic.return_value
-            agent = mini_pkg.build_agent(args)
-
-    mock_anthropic.assert_called_once()
-    assert mock_anthropic.call_args.kwargs["model"] == "claude-sonnet-4-5-20250929"
-    assert mock_anthropic.call_args.kwargs["base_url"] == "https://www.right.codes/claude/v1"
-    assert mock_anthropic.call_args.kwargs["api_key"] == "sk-openai-fallback"
-    assert agent.model_client is fake_client
-
-
-def test_build_agent_uses_anthropic_default_model_when_env_is_missing(tmp_path):
-    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "anthropic"])
-
-    with patch.dict(
-        os.environ,
-        {},
-        clear=False,
-    ):
-        os.environ.pop("ANTHROPIC_MODEL", None)
-        with patch("codeforge.cli.AnthropicCompatibleModelClient") as mock_anthropic:
-            mini_pkg.build_agent(args)
-
-    assert mock_anthropic.call_args.kwargs["model"] == "claude-sonnet-4-6"
-
-
-def test_build_agent_uses_deepseek_provider_and_env_configuration(tmp_path):
-    (tmp_path / ".env").write_text(
-        "\n".join(
-            [
-                "CODEFORGE_DEEPSEEK_API_BASE=https://api.deepseek.com/anthropic",
-                "CODEFORGE_DEEPSEEK_API_KEY=sk-project-deepseek",
-                "CODEFORGE_DEEPSEEK_MODEL=deepseek-v4-pro",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    args = type(
-        "Args",
-        (),
-        {
-            "cwd": str(tmp_path),
-            "provider": "deepseek",
-            "model": None,
-            "base_url": None,
-            "host": "http://127.0.0.1:11434",
-            "ollama_timeout": 300,
-            "openai_timeout": 300,
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "resume": None,
-            "approval": "ask",
-            "secret_env_names": [],
-            "max_steps": 6,
-            "max_new_tokens": 512,
-        },
-    )()
-
-    with patch.dict(
-        os.environ,
-        {
-            "DEEPSEEK_API_BASE": "https://legacy.deepseek.example/anthropic",
-            "DEEPSEEK_API_KEY": "sk-legacy-deepseek",
-            "DEEPSEEK_MODEL": "legacy-deepseek-model",
-            "ANTHROPIC_API_KEY": "sk-anthropic",
-            "OPENAI_API_KEY": "sk-openai",
-        },
-        clear=True,
-    ):
-        with patch(
-            "codeforge.cli.OllamaModelClient",
-            side_effect=AssertionError("ollama client should not be used"),
-        ), patch(
-            "codeforge.cli.OpenAICompatibleModelClient",
-            side_effect=AssertionError("openai client should not be used"),
-        ), patch("codeforge.cli.AnthropicCompatibleModelClient") as mock_anthropic:
-            fake_client = mock_anthropic.return_value
-            agent = mini_pkg.build_agent(args)
-
-    mock_anthropic.assert_called_once()
-    assert mock_anthropic.call_args.kwargs["model"] == "deepseek-v4-pro"
-    assert mock_anthropic.call_args.kwargs["base_url"] == "https://api.deepseek.com/anthropic"
-    assert mock_anthropic.call_args.kwargs["api_key"] == "sk-project-deepseek"
-    assert agent.model_client is fake_client
-
-
-def test_build_agent_uses_deepseek_default_model_when_env_is_missing(tmp_path):
-    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--provider", "deepseek"])
-
-    with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-deepseek"}, clear=True):
-        with patch("codeforge.cli.AnthropicCompatibleModelClient") as mock_anthropic:
-            mini_pkg.build_agent(args)
-
-    assert mock_anthropic.call_args.kwargs["model"] == "deepseek-v4-pro"
-    assert mock_anthropic.call_args.kwargs["base_url"] == "https://api.deepseek.com/anthropic"
-
-
-def test_build_agent_uses_openai_provider_by_default(tmp_path):
-    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
-
-    with patch.dict(
-        os.environ,
-        {
-            "OPENAI_API_BASE": "https://www.right.codes/codex/v1",
-            "OPENAI_API_KEY": "sk-test",
-        },
-        clear=False,
-    ):
-        with patch(
-            "codeforge.cli.OllamaModelClient",
-            side_effect=AssertionError("ollama client should not be used"),
-        ), patch("codeforge.cli.OpenAICompatibleModelClient") as mock_openai:
-            fake_client = mock_openai.return_value
-            agent = mini_pkg.build_agent(args)
-
-    mock_openai.assert_called_once()
-    assert mock_openai.call_args.kwargs["model"] == "gpt-5.4"
-    assert mock_openai.call_args.kwargs["base_url"] == "https://www.right.codes/codex/v1"
-    assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
-    assert agent.model_client is fake_client
 
 
 def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
@@ -1589,7 +1138,7 @@ def test_public_api_exports_resolve_through_package_path():
     assert callable(build_welcome)
     assert FakeModelClient is not None
     assert MiniAgent is not None
-    assert OllamaModelClient is not None
+    assert OpenAICompatibleModelClient is not None
     assert SessionStore is not None
     assert WorkspaceContext is not None
     assert Path(mini_pkg.__file__).as_posix().endswith("/codeforge/__init__.py")
@@ -1628,3 +1177,140 @@ def test_module_execution_help_works():
 
     assert result.returncode == 0
     assert "usage:" in result.stdout.lower()
+
+
+def test_build_arg_parser_exposes_one_model_protocol(tmp_path):
+    args = mini_pkg.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
+    assert not hasattr(args, "provider")
+    assert args.base_url is None
+    assert args.prompt_cache_mode is None
+
+
+def test_build_agent_uses_generic_openai_compatible_configuration(tmp_path):
+    args = mini_pkg.build_arg_parser().parse_args(
+        ["--cwd", str(tmp_path), "--model", "override-model"]
+    )
+    with patch.dict(
+        os.environ,
+        {
+            "CODEFORGE_API_BASE": "https://api.deepseek.com",
+            "CODEFORGE_API_KEY": "sk-test",
+            "CODEFORGE_MODEL": "env-model",
+        },
+        clear=True,
+    ):
+        with patch("codeforge.cli.OpenAICompatibleModelClient") as mock_client:
+            fake_client = mock_client.return_value
+            agent = mini_pkg.build_agent(args)
+
+    mock_client.assert_called_once()
+    assert mock_client.call_args.kwargs["model"] == "override-model"
+    assert mock_client.call_args.kwargs["base_url"] == "https://api.deepseek.com"
+    assert mock_client.call_args.kwargs["api_key"] == "sk-test"
+    assert mock_client.call_args.kwargs["prompt_cache_mode"] == "auto"
+    assert agent.model_client is fake_client
+
+
+def test_deepseek_uses_automatic_prompt_cache_and_records_hit_usage():
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+        def read(self):
+            return json.dumps({
+                "choices": [{"message": {"role": "assistant", "content": "<final>ok</final>"}}],
+                "usage": {
+                    "prompt_tokens": 2048,
+                    "prompt_tokens_details": {"cached_tokens": 1536},
+                    "prompt_cache_hit_tokens": 1536,
+                    "prompt_cache_miss_tokens": 512,
+                    "completion_tokens": 16,
+                    "total_tokens": 2064,
+                },
+            }).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+    assert client.prompt_cache_strategy == "automatic"
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = client.complete(
+            "stable prefix\nrequest", 32,
+            prompt_cache_key="prefix-123",
+        )
+    assert result == "<final>ok</final>"
+    assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert "prompt_cache_key" not in captured["body"]
+    assert client.last_completion_metadata["cached_tokens"] == 1536
+    assert client.last_completion_metadata["cache_miss_tokens"] == 512
+    assert client.last_completion_metadata["cache_hit"] is True
+    assert client.last_completion_metadata["prompt_cache_strategy"] == "automatic"
+
+
+def test_openai_compatible_client_converts_native_tool_call_to_runtime_tool_text():
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+        def read(self):
+            return json.dumps({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path":"hello.py","start":1,"end":20}',
+                            },
+                        }],
+                    }
+                }]
+            }).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    tools = [{
+        "type": "function",
+        "name": "read_file",
+        "description": "Read a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    }]
+    client = OpenAICompatibleModelClient(
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = client.complete("prompt", 64, tools=tools)
+
+    assert captured["body"]["tool_choice"] == "auto"
+    assert captured["body"]["tools"][0]["function"]["name"] == "read_file"
+    assert result == '<tool>{"name": "read_file", "args": {"path": "hello.py", "start": 1, "end": 20}}</tool>'
