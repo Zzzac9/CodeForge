@@ -889,7 +889,7 @@ class CodeForge:
         self.last_durable_superseded = superseded
         return promoted, rejections, superseded
 
-    def ask(self, user_message):
+    def ask(self, user_message, progress_callback=None):
         """执行一次完整的 agent 回合，直到产出最终答案或命中停止条件。
 
         为什么存在：
@@ -909,6 +909,16 @@ class CodeForge:
         如果新人想理解 codeforge 是怎么“从一句话跑成一个 agent 流程”的，
         这里就是最关键的入口。
         """
+        def progress(event, **payload):
+            if progress_callback is None:
+                return
+            safe_payload = self.redact_artifact({"event": event, **payload})
+            try:
+                progress_callback(safe_payload)
+            except Exception:
+                # Terminal/UI rendering must never change runtime semantics.
+                return
+
         # 记录本次 ask() 开始的单调时钟时间，用于后面计算运行耗时
         run_started_at = time.monotonic()
         # 把当前用户请求写入工作记忆的任务摘要，方便后续 prompt 继续围绕这个目标推进
@@ -966,6 +976,11 @@ class CodeForge:
                     "prompt_metadata": prompt_metadata,
                     "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
                 },
+            )
+            progress(
+                "model_started",
+                attempt=task_state.attempts,
+                tool_steps=task_state.tool_steps,
             )
             if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
@@ -1034,6 +1049,11 @@ class CodeForge:
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
                 tools=self.model_tool_specs(),
+                on_token=(
+                    (lambda token: progress("model_delta", text=token))
+                    if progress_callback is not None
+                    else None
+                ),
             )
 
             # 读取模型客户端留下的元数据，例如 usage、cached_tokens、cache_hit 等
@@ -1049,6 +1069,7 @@ class CodeForge:
 
             # 解析模型原始输出，把文本转成 runtime 能识别的分支：tool / final / retry
             kind, payload = self.parse(raw)
+            progress("model_finished", kind=kind)
 
             # 写入 model_parsed trace，记录解析结果、模型元数据和调用耗时
             self.emit_trace(
@@ -1067,6 +1088,12 @@ class CodeForge:
 
                 # 记录工具执行开始时间，用于后面统计工具耗时
                 tool_started_at = time.monotonic()
+                progress(
+                    "tool_started",
+                    step=tool_steps + 1,
+                    name=name,
+                    args=args,
+                )
                 result = self.run_tool(name, args)
 
                 # rejected 调用没有真正执行，不消耗 tool step；否则计入预算。
@@ -1075,6 +1102,16 @@ class CodeForge:
                 if tool_status != "rejected":
                     tool_steps += 1
                     task_state.record_tool(name)
+                progress(
+                    "tool_finished",
+                    step=tool_steps,
+                    name=name,
+                    status=tool_status or "completed",
+                    affected_paths=list(
+                        (self._last_tool_result_metadata or {}).get("affected_paths", [])
+                    ),
+                    duration_ms=int((time.monotonic() - tool_started_at) * 1000),
+                )
 
                 # 把工具执行结果写入 session history，下一轮 prompt 可以看到这次工具反馈
                 self.record(

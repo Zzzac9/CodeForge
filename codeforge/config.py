@@ -1,4 +1,9 @@
-"""Project-local configuration helpers."""
+"""Environment-file configuration helpers.
+
+The CodeForge installation ``.env`` supplies portable defaults.  A target
+project may override those defaults with its own ``.env`` without changing
+where that project's runtime state is stored.
+"""
 
 import os
 import re
@@ -6,6 +11,26 @@ from pathlib import Path
 
 
 ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+NORMALIZED_ENV_ALIASES = {
+    "CODEFORGE_API_BASE": (
+        "CODEFORGE_DEEPSEEK_API_BASE",
+        "DEEPSEEK_API_BASE",
+        "CODEFORGE_OPENAI_API_BASE",
+        "OPENAI_API_BASE",
+    ),
+    "CODEFORGE_API_KEY": (
+        "CODEFORGE_DEEPSEEK_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "CODEFORGE_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+    ),
+    "CODEFORGE_MODEL": (
+        "CODEFORGE_DEEPSEEK_MODEL",
+        "DEEPSEEK_MODEL",
+        "CODEFORGE_OPENAI_MODEL",
+        "OPENAI_MODEL",
+    ),
+}
 
 
 def _strip_quotes(value):
@@ -41,19 +66,58 @@ def find_project_env(start):
     return None
 
 
-def load_project_env(start, override=True):
-    env_path = find_project_env(start)
-    if env_path is None:
-        return {}
+def codeforge_root():
+    """Return the installation root without relying on a machine-specific path."""
+    return Path(__file__).resolve().parent.parent
+
+
+def find_codeforge_env():
+    """Return the installation-level default env file when it exists."""
+    env_path = codeforge_root() / ".env"
+    return env_path if env_path.is_file() else None
+
+
+def _load_env_file(env_path, override):
     loaded = {}
-    for line in env_path.read_text(encoding="utf-8").splitlines():
+    if env_path is None:
+        return loaded
+    for line in Path(env_path).read_text(encoding="utf-8").splitlines():
         parsed = _parse_env_line(line)
         if parsed is None:
             continue
         name, value = parsed
         loaded[name] = value
+    # Normalize model aliases inside each layer before applying it.  This is
+    # important for source priority: a target project's OPENAI_API_KEY must
+    # override an installation-level CODEFORGE_API_KEY, not lose merely because
+    # provider_env checks the canonical name first.
+    for canonical, aliases in NORMALIZED_ENV_ALIASES.items():
+        if canonical in loaded:
+            continue
+        for alias in aliases:
+            if loaded.get(alias):
+                loaded[canonical] = loaded[alias]
+                break
+    for name, value in loaded.items():
         if override or name not in os.environ:
             os.environ[name] = value
+    return loaded
+
+
+def load_project_env(start, override=True):
+    """Load system < installation .env < target project .env.
+
+    ``override=True`` is the CLI path and establishes the documented layer
+    order.  The project and installation file may be the same file when
+    CodeForge is run against its own source tree; it is loaded only once.
+    """
+    installation_env = find_codeforge_env()
+    project_env = find_project_env(start)
+    loaded = _load_env_file(installation_env, override=override)
+    if project_env is not None and (
+        installation_env is None or project_env.resolve() != installation_env.resolve()
+    ):
+        loaded.update(_load_env_file(project_env, override=override))
     return loaded
 
 

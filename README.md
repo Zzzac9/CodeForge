@@ -92,7 +92,7 @@ python -m codeforge
 
 ### 3. 配置模型
 
-CodeForge 不再按 provider 维护多套协议，只使用一套 **OpenAI-compatible Chat Completions** 接口。切换模型服务只需要改三个值：
+CodeForge 不再按 provider 维护多套协议，只使用一套 **OpenAI-compatible Chat Completions** 接口。默认模型配置放在 CodeForge 安装根目录的 `.env`。程序通过 Python 包所在位置定位该目录，不依赖某台机器上的绝对路径；因此从其他项目目录执行 `codeforge` 时也会自动读取同一份默认配置：
 
 ```env
 CODEFORGE_API_BASE=https://api.deepseek.com
@@ -103,11 +103,24 @@ CODEFORGE_PROMPT_CACHE_MODE=auto
 
 例如切换到其他支持 Chat Completions API 的 OpenAI-compatible endpoint，只需要替换 `API_BASE`、`API_KEY` 和 `MODEL`。Runtime、Tool Calling、Memory、Checkpoint 与 Trace 都不需要变化。
 
-配置优先级：
+目标项目仍可用自己的 `.env` 覆盖默认配置。配置优先级为：
 
 ```text
-显式 CLI 参数 > .env 中的 CODEFORGE_* 变量 > 兼容旧环境变量 > 代码默认值
+显式 CLI 参数 > 目标项目 .env > CodeForge 安装根目录 .env > 系统环境变量 > 代码默认值
 ```
+
+Windows PowerShell 示例：
+
+```powershell
+# 编辑 CodeForge 安装目录中的唯一默认配置
+notepad .env
+
+# 切换到任意代码项目；模型默认配置仍来自 CodeForge 安装目录
+Set-Location D:\work\another-project
+codeforge
+```
+
+`.env` 已被 Git 忽略。CodeForge 不会把 API Key 写入 Trace、Report 或欢迎界面；不要把 Key 放到命令行、提交记录或项目文档中。Session、Memory、Checkpoint 和 Trace 仍写入当前目标工作区自己的 `.codeforge/`，不会在项目间共享。
 
 ## 常用启动方式
 
@@ -116,6 +129,8 @@ CODEFORGE_PROMPT_CACHE_MODE=auto
 ```bash
 codeforge
 ```
+
+模型回答默认通过服务端 SSE 流式显示。Agent 调用工具时，终端会同步显示当前轮次和步骤，例如“读取文件 README.md”；工具调用正文不会作为模型回答打印，步骤参数会先经过现有敏感信息脱敏。
 
 临时覆盖模型或 API 地址：
 

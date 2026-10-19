@@ -60,8 +60,139 @@ HELP_DETAILS = textwrap.dedent(
 ).strip()
 
 
+class ConsoleProgressRenderer:
+    """Render runtime steps and final model content without exposing tool payloads."""
+
+    _CLOSE_FINAL = "</final>"
+
+    def __init__(self, output=None, status_output=None):
+        self.output = output or sys.stdout
+        self.status_output = status_output or sys.stderr
+        self._mode = "idle"
+        self._probe = ""
+        self._pending = ""
+        self.answer_streamed = False
+
+    def _status(self, text):
+        print(f"[agent] {text}", file=self.status_output, flush=True)
+
+    def _write_final(self, text):
+        if not text:
+            return
+        self.answer_streamed = True
+        self.output.write(text)
+        self.output.flush()
+
+    def _feed_final(self, text):
+        self._pending += text
+        hold = len(self._CLOSE_FINAL)
+        if len(self._pending) > hold:
+            self._write_final(self._pending[:-hold])
+            self._pending = self._pending[-hold:]
+
+    def _feed_delta(self, text):
+        if self._mode == "tool":
+            return
+        if self._mode == "final":
+            self._feed_final(text)
+            return
+
+        self._probe += text
+        stripped = self._probe.lstrip()
+        if stripped.startswith("<tool"):
+            self._mode = "tool"
+            self._probe = ""
+            return
+        if stripped.startswith("<final>"):
+            self._mode = "final"
+            content = stripped[len("<final>"):]
+            self._probe = ""
+            self._feed_final(content)
+            return
+        if "<tool".startswith(stripped) or "<final>".startswith(stripped):
+            return
+        self._mode = "final"
+        content = self._probe
+        self._probe = ""
+        self._feed_final(content)
+
+    def _finish_model(self, kind):
+        if kind != "final":
+            self._mode = "idle"
+            self._probe = ""
+            self._pending = ""
+            return
+        if self._mode == "undecided" and self._probe:
+            self._mode = "final"
+            self._feed_final(self._probe)
+            self._probe = ""
+        tail = self._pending
+        if tail.endswith(self._CLOSE_FINAL):
+            tail = tail[:-len(self._CLOSE_FINAL)]
+        self._write_final(tail)
+        self._pending = ""
+        if self.answer_streamed:
+            self.output.write("\n")
+            self.output.flush()
+        self._mode = "idle"
+
+    @staticmethod
+    def _tool_description(name, args):
+        path = str(args.get("path", "."))
+        if name == "read_file":
+            return f"读取文件 {path}"
+        if name == "list_files":
+            return f"列出目录 {path}"
+        if name == "search":
+            return f"在 {path} 中搜索 {args.get('pattern', '')!r}"
+        if name == "write_file":
+            return f"写入文件 {path}"
+        if name == "patch_file":
+            return f"修改文件 {path}"
+        if name == "run_shell":
+            command = str(args.get("command", ""))
+            if len(command) > 100:
+                command = command[:97] + "..."
+            return f"运行 Shell：{command}"
+        if name == "delegate":
+            return "执行只读子任务"
+        return f"调用工具 {name}"
+
+    def __call__(self, event):
+        kind = event.get("event")
+        if kind == "model_started":
+            self._mode = "undecided"
+            self._probe = ""
+            self._pending = ""
+            self._status(f"正在思考（第 {event.get('attempt', 1)} 轮）…")
+        elif kind == "model_delta":
+            self._feed_delta(str(event.get("text", "")))
+        elif kind == "model_finished":
+            self._finish_model(str(event.get("kind", "")))
+        elif kind == "tool_started":
+            description = self._tool_description(
+                str(event.get("name", "")), dict(event.get("args", {}) or {})
+            )
+            self._status(f"步骤 {event.get('step', '?')}：{description}")
+        elif kind == "tool_finished":
+            self._status(
+                f"{event.get('name', 'tool')} {event.get('status', 'completed')} "
+                f"({event.get('duration_ms', 0)} ms)"
+            )
+
+    def finish(self, answer):
+        if not self.answer_streamed:
+            print(answer, file=self.output)
+
+
+def _run_request(agent, prompt):
+    renderer = ConsoleProgressRenderer()
+    answer = agent.ask(prompt, progress_callback=renderer)
+    renderer.finish(answer)
+
+
 # ---- 统一 OpenAI-compatible Chat Completions 模型配置 ----
-DEFAULT_MODEL = "deepseek-v4-pro"
+DEFAULT_MODEL = "deepseek-flash"
 DEFAULT_API_BASE_URL = "https://api.deepseek.com"
 DEFAULT_API_TIMEOUT = 300
 DEFAULT_PROMPT_CACHE_MODE = "auto"
@@ -409,9 +540,9 @@ def main(argv=None):
         if prompt:
             print()
             try:
-                print(agent.ask(prompt))
+                _run_request(agent, prompt)
             except RuntimeError as exc:
-                print(str(exc), file=sys.stderr)
+                print(agent.redact_text(str(exc)), file=sys.stderr)
                 return 1
         return 0
 
@@ -452,6 +583,6 @@ def main(argv=None):
         # 非内置命令：交给 agent 的 ask() 处理（模型推理 + 工具调用）。
         print()
         try:
-            print(agent.ask(user_input))
+            _run_request(agent, user_input)
         except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
+            print(agent.redact_text(str(exc)), file=sys.stderr)

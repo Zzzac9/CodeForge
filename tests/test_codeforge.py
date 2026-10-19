@@ -2,6 +2,7 @@ import os
 import json
 import subprocess
 import sys
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from codeforge import (
     build_welcome,
 )
 from codeforge.sandbox import ShellSandboxConfig
+from codeforge.cli import ConsoleProgressRenderer
 
 
 def build_workspace(tmp_path):
@@ -1233,7 +1235,11 @@ def test_build_agent_uses_generic_openai_compatible_configuration(tmp_path):
         },
         clear=True,
     ):
-        with patch("codeforge.cli.OpenAICompatibleModelClient") as mock_client:
+        with patch("codeforge.config.find_codeforge_env", return_value=None), patch(
+            "codeforge.config.find_project_env", return_value=None
+        ), patch(
+            "codeforge.cli.OpenAICompatibleModelClient"
+        ) as mock_client:
             fake_client = mock_client.return_value
             agent = mini_pkg.build_agent(args)
 
@@ -1348,3 +1354,113 @@ def test_openai_compatible_client_converts_native_tool_call_to_runtime_tool_text
     assert captured["body"]["tool_choice"] == "auto"
     assert captured["body"]["tools"][0]["function"]["name"] == "read_file"
     assert result == '<tool>{"name": "read_file", "args": {"path": "hello.py", "start": 1, "end": 20}}</tool>'
+
+
+def test_openai_compatible_client_streams_sse_content():
+    captured = {}
+
+    class FakeStreamingResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            chunks = [
+                {"choices": [{"delta": {"content": "<final>Hel"}}]},
+                {"choices": [{"delta": {"content": "lo</final>"}}]},
+                {"choices": [], "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}},
+            ]
+            for chunk in chunks:
+                yield ("data: " + json.dumps(chunk) + "\n\n").encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["accept"] = request.headers["Accept"]
+        return FakeStreamingResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="stream-model",
+        base_url="https://example.com",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+    tokens = []
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = client.complete("hello", 42, on_token=tokens.append)
+
+    assert captured["body"]["stream"] is True
+    assert captured["accept"] == "text/event-stream"
+    assert tokens == ["<final>Hel", "lo</final>"]
+    assert result == "<final>Hello</final>"
+    assert client.last_completion_metadata["total_tokens"] == 6
+
+
+def test_openai_compatible_client_reassembles_streamed_native_tool_call():
+    class FakeStreamingResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            chunks = [
+                {
+                    "choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"REA'},
+                    }]}}]
+                },
+                {
+                    "choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": 'DME.md","start":1}'},
+                    }]}}]
+                },
+            ]
+            for chunk in chunks:
+                yield ("data: " + json.dumps(chunk) + "\n\n").encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+    client = OpenAICompatibleModelClient(
+        model="stream-model",
+        base_url="https://example.com",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+    tokens = []
+    with patch("urllib.request.urlopen", return_value=FakeStreamingResponse()):
+        result = client.complete("hello", 42, tools=[], on_token=tokens.append)
+
+    assert tokens == []
+    assert result == '<tool>{"name": "read_file", "args": {"path": "README.md", "start": 1}}</tool>'
+
+
+def test_console_progress_streams_final_and_hides_tool_markup():
+    output = StringIO()
+    status = StringIO()
+    renderer = ConsoleProgressRenderer(output=output, status_output=status)
+
+    renderer({"event": "model_started", "attempt": 1})
+    renderer({"event": "model_delta", "text": "<tool>"})
+    renderer({"event": "model_delta", "text": '{"name":"read_file"}</tool>'})
+    renderer({"event": "model_finished", "kind": "tool"})
+    renderer({"event": "tool_started", "step": 1, "name": "read_file", "args": {"path": "README.md"}})
+    renderer({"event": "tool_finished", "name": "read_file", "status": "success", "duration_ms": 3})
+    renderer({"event": "model_started", "attempt": 2})
+    renderer({"event": "model_delta", "text": "<final>完成"})
+    renderer({"event": "model_delta", "text": "啦</final>"})
+    renderer({"event": "model_finished", "kind": "final"})
+    renderer.finish("完成啦")
+
+    assert output.getvalue() == "完成啦\n"
+    assert "<tool>" not in output.getvalue()
+    assert "读取文件 README.md" in status.getvalue()
+    assert "正在思考（第 2 轮）" in status.getvalue()

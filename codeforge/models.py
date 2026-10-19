@@ -180,6 +180,66 @@ def _extract_usage_cache_details(data):
     }
 
 
+def _iter_sse_events(response):
+    """Yield decoded JSON payloads from an OpenAI-compatible SSE response."""
+    for raw_line in response:
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", errors="replace")
+        else:
+            line = str(raw_line)
+        line = line.strip()
+        if not line or line.startswith(":") or not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            yield json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "OpenAI-compatible streaming error: backend returned invalid SSE JSON"
+            ) from exc
+
+
+def _consume_stream(response, on_token):
+    """Consume content/tool deltas and rebuild one normal response object."""
+    content_parts = []
+    tool_calls = {}
+    usage = {}
+    for event in _iter_sse_events(response):
+        if event.get("error"):
+            raise RuntimeError(f"OpenAI-compatible error: {event['error']}")
+        if isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+        choices = event.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            content_parts.append(content)
+            if on_token is not None:
+                on_token(content)
+        for item in delta.get("tool_calls") or []:
+            index = int(item.get("index", 0))
+            current = tool_calls.setdefault(
+                index,
+                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+            )
+            if item.get("id"):
+                current["id"] += str(item["id"])
+            function = item.get("function") or {}
+            if function.get("name"):
+                current["function"]["name"] += str(function["name"])
+            if function.get("arguments"):
+                current["function"]["arguments"] += str(function["arguments"])
+
+    message = {"role": "assistant", "content": "".join(content_parts) or None}
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+    return {"choices": [{"message": message}], "usage": usage}
+
+
 class OpenAICompatibleModelClient:
     """Single production client using OpenAI-compatible Chat Completions."""
 
@@ -191,12 +251,14 @@ class OpenAICompatibleModelClient:
         temperature,
         timeout,
         prompt_cache_mode="auto",
+        stream=True,
     ):
         self.model = model
         self.base_url = _normalize_versioned_base_url(base_url)
         self.api_key = api_key
         self.temperature = temperature
         self.timeout = timeout
+        self.stream = bool(stream)
         self.prompt_cache_strategy = _cache_strategy(
             self.base_url, prompt_cache_mode
         )
@@ -214,13 +276,15 @@ class OpenAICompatibleModelClient:
         prompt_cache_key=None,
         prompt_cache_retention=None,
         tools=None,
+        on_token=None,
     ):
         self.last_completion_metadata = {}
+        use_stream = self.stream and on_token is not None
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_new_tokens,
-            "stream": False,
+            "stream": use_stream,
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
@@ -239,7 +303,7 @@ class OpenAICompatibleModelClient:
 
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "text/event-stream" if use_stream else "application/json",
             "User-Agent": OPENAI_COMPATIBLE_USER_AGENT,
         }
         if self.api_key:
@@ -253,23 +317,46 @@ class OpenAICompatibleModelClient:
         )
 
         body_text = ""
+        data = None
+        stream_emitted = False
+
+        def emit_token(token):
+            nonlocal stream_emitted
+            stream_emitted = True
+            on_token(token)
+
         attempts = 3
         for attempt in range(attempts):
             try:
                 with urllib.request.urlopen(
                     request, timeout=self.timeout
                 ) as response:
-                    body_text = response.read().decode("utf-8")
+                    if use_stream:
+                        try:
+                            data = _consume_stream(response, emit_token)
+                        except RuntimeError as exc:
+                            safe_message = str(exc)
+                            if self.api_key:
+                                safe_message = safe_message.replace(self.api_key, "[REDACTED]")
+                            raise RuntimeError(safe_message) from exc
+                    else:
+                        body_text = response.read().decode("utf-8")
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
                 if exc.code >= 500 and attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
                     continue
+                safe_body = body.replace(self.api_key, "[REDACTED]") if self.api_key else body
                 raise RuntimeError(
-                    f"OpenAI-compatible request failed with HTTP {exc.code}: {body}"
+                    f"OpenAI-compatible request failed with HTTP {exc.code}: {safe_body}"
                 ) from exc
             except (urllib.error.URLError, RemoteDisconnected) as exc:
+                if use_stream and stream_emitted:
+                    raise RuntimeError(
+                        "OpenAI-compatible stream was interrupted after output began; "
+                        "the request was not retried to avoid duplicate output"
+                    ) from exc
                 if attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
                     continue
@@ -279,15 +366,19 @@ class OpenAICompatibleModelClient:
                     f"Model: {self.model}"
                 ) from exc
 
-        try:
-            data = json.loads(body_text)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "OpenAI-compatible error: backend returned non-JSON content"
-            ) from exc
+        if data is None:
+            try:
+                data = json.loads(body_text)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "OpenAI-compatible error: backend returned non-JSON content"
+                ) from exc
 
         if data.get("error"):
-            raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
+            error_text = str(data["error"])
+            if self.api_key:
+                error_text = error_text.replace(self.api_key, "[REDACTED]")
+            raise RuntimeError(f"OpenAI-compatible error: {error_text}")
 
         self._record_completion_metadata(
             data,
