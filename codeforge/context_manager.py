@@ -155,7 +155,9 @@ class ContextManager:
         if hasattr(self.agent, "render_checkpoint_text"):
             checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
         if checkpoint_text:
-            section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
+            # Put recovery-critical state first so prefix clipping cannot silently
+            # discard it when tool/security documentation grows.
+            section_texts["prefix"] = checkpoint_text + "\n\n" + section_texts["prefix"]
 
         # 根据当前用户请求，从 memory 中召回最相关的少量笔记
         selected_notes = []

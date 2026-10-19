@@ -1,8 +1,10 @@
 import hashlib
 import json
 import locale as locale_module
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -110,6 +112,8 @@ def _git_value(args, fallback="", cwd=None):
             cwd=cwd or Path.cwd(),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
             timeout=5,
         )
@@ -484,12 +488,17 @@ class BenchmarkEvaluator:
         expected_artifact_exists = artifact_file.exists()
         artifact_digest = _digest_file(artifact_file) if expected_artifact_exists else ""
 
+        verifier_command = task["verifier"]
+        if os.name == "nt" and verifier_command.startswith("python3 "):
+            verifier_command = subprocess.list2cmdline([sys.executable]) + verifier_command[len("python3"):]
         verifier = subprocess.run(
-            task["verifier"],
+            verifier_command,
             cwd=fixture_copy_root,
             shell=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
 
         within_budget = task_state.tool_steps <= int(task["step_budget"])

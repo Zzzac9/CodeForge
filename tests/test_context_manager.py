@@ -4,7 +4,7 @@ from codeforge.context_manager import ContextManager
 
 def build_workspace(tmp_path):
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
-    return WorkspaceContext.build(tmp_path)
+    return WorkspaceContext.build(tmp_path, repo_root_override=tmp_path)
 
 
 def build_agent(tmp_path, outputs, **kwargs):

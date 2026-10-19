@@ -692,23 +692,45 @@ running → failed     (exception)
 
 ## 12. 安全边界
 
-### 12.1 路径沙箱
+### 12.1 决策链与分阶段改造
 
-```python
-CodeForge.path(raw_path)
-    → os.path.normpath(os.path.join(workspace.cwd, raw_path))
-    → 检查 commonpath 必须在 workspace.repo_root 之下
-    → 防止 ../ 和符号链接逃逸
-```
+当前执行链明确拆成五步：`参数校验 → 动态风险分析 → 强制安全检查 → 审批 → 执行`。Registry 的 `risky` 仍表示能力级静态风险；动态分析补充本次参数、目标路径、风险等级、可能影响和未知影响。`approval_result` 与 `safety_check_passed` 分开记录，所以 `auto` 只能得到审批许可，不能绕过只读模式、禁止操作或沙箱配置。
 
-### 12.2 环境变量隔离
+改造分三阶段：
 
-`run_shell` 只继承白名单环境变量：
-- `HOME`, `PATH`, `TERM`, `USER`, `SHELL`, `LANG`
-- `VIRTUAL_ENV`, `CONDA_PREFIX`
-- 不泄露父 shell 的完整环境
+1. 已完成：操作级风险、强制禁止策略、审批展示、Trace 字段、文件路径/原子写入加固。
+2. 已完成并可单测：Docker 生命周期、Windows Docker Desktop 探测/按需启动、每次调用独立容器、超时清理和显式 `unsafe-host`。
+3. 运行环境验证：在目标 CI/开发机上准备受信任镜像，执行真实 Docker 集成测试和镜像供应链审计；没有可用 Engine/镜像时必须报告未验证，不能用 mock 结果冒充隔离验证。
 
-### 12.3 Secret 脱敏
+### 12.2 文件路径与原子写入
+
+`secure_workspace_path()` 同时检查词法路径和解析后路径均位于固定的 `workspace root`，并拒绝路径链中的符号链接与 Windows reparse point。Runtime 刷新工作区信息时复用既定 root，不重新发现父级 Git 仓库，避免边界意外扩大。
+
+`read_file`、`write_file`、`patch_file` 和 `search` 在实际 I/O 前重新检查路径。写入通过同目录临时文件、flush、`fsync`、权限继承和 `os.replace` 提交；异常时清理临时文件。`patch_file` 在提交前重新读取文件并要求 `old_text` 恰好出现一次。
+
+这显著缩小 TOCTOU 窗口，但 Windows 标准库无法为整条父目录链提供与 POSIX `openat + O_NOFOLLOW` 等价的事务式句柄遍历；对抗可并发改写目录 reparse point 的本地高权限攻击者仍属于残余风险。
+
+### 12.3 Docker Shell 隔离与生命周期
+
+默认 `run_shell` 后端是 Docker，而不是宿主 `shell=True`：
+
+- 启动时探测 Docker Engine；Windows 可启动已安装的 Docker Desktop并按超时等待。
+- 镜像必须已在本地，运行时只 `inspect`，不隐式下载。
+- 每次调用创建唯一命名临时容器，结束、失败、超时或取消时执行 `docker rm -f`。
+- 使用非 root UID/GID、`--network none`、只读容器根文件系统、`cap-drop ALL`、`no-new-privileges`、只读 `/tmp` 之外的根文件系统，并限制 CPU、内存和 PID。
+- 只挂载 workspace；默认 `read-only`，可显式改为 `read-write`；不挂载 Docker Socket或宿主敏感目录。
+- CodeForge 退出时只清理实例内跟踪的容器，不枚举或停止其他容器，也不关闭 Docker Desktop。
+- Docker 不可用或镜像缺失时安全失败，绝不回退到宿主机。
+
+`unsafe-host` 是单独、明确标红语义的兼容后端。Windows 超时使用 Job Object 终止整棵子进程树；它仍不提供容器级隔离，不能称为沙箱。
+
+Docker 边界并非绝对安全：它依赖 Docker Engine、宿主内核、Docker Desktop 文件共享层和受信任镜像。`read-write` 挂载允许命令破坏工作区内容；禁网也不等于阻止所有侧信道。
+
+### 12.4 环境变量隔离
+
+Shell 只继承显式白名单环境变量。Docker CLI 自身需要的 `DOCKER_HOST` / `DOCKER_CONTEXT` 只用于宿主侧连接，不传进容器；Secret 名和值继续在 Trace/Report 中脱敏。
+
+### 12.5 Secret 脱敏
 
 ```python
 CodeForge.redact_text(text)
@@ -718,14 +740,14 @@ CodeForge.redact_text(text)
 
 在 trace 和 report 写入前自动脱敏。
 
-### 12.4 子 Agent 只读委托
+### 12.6 子 Agent 只读委托
 
 `tool_delegate` 创建子 `CodeForge` 时：
 - `read_only=True` → 不能执行 write_file / patch_file / run_shell
 - `approval_policy="never"` → 不弹交互确认
 - `depth + 1`，有最大深度限制
 
-### 12.5 审批防线
+### 12.7 审批防线
 
 | 工具类型 | safe (list_files, read_file, search, delegate) | risky (write_file, patch_file, run_shell) |
 |---|---|---|
@@ -733,9 +755,11 @@ CodeForge.redact_text(text)
 | `--approval auto` | 直接执行 | 自动批准 |
 | `--approval never` | 直接执行 | **拒绝** |
 
-### 12.6 重复调用检测
+`ask` 会显示工具名、完整参数（敏感值脱敏）、目标路径、风险等级、可能影响和未知影响。明显危险命令先被强制策略拒绝，不进入审批；这套规则是 Docker 隔离之外的纵深防御，不以关键词检查冒充真正沙箱。
 
-最近 2 次调用的 `(name, args)` 完全一致 → 自动拒绝，防止死循环。
+### 12.8 重复调用检测
+
+最近一次调用的 `(name, args)` 完全一致 → 自动拒绝，防止死循环。
 
 ---
 

@@ -1,22 +1,27 @@
 import os
 import shlex
+import subprocess
 import sys
 from unittest.mock import patch
 
+import pytest
+
 from codeforge import FakeModelClient, MiniAgent, SessionStore, WorkspaceContext
 from codeforge import cli as mini_cli
+from codeforge.sandbox import ShellSandboxConfig
 from codeforge.task_state import TaskState
 
 
 def build_workspace(tmp_path):
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
-    return WorkspaceContext.build(tmp_path)
+    return WorkspaceContext.build(tmp_path, repo_root_override=tmp_path)
 
 
 def build_agent(tmp_path, outputs, **kwargs):
     workspace = build_workspace(tmp_path)
     store = SessionStore(tmp_path / ".codeforge" / "sessions")
     approval_policy = kwargs.pop("approval_policy", "auto")
+    kwargs.setdefault("shell_sandbox_config", ShellSandboxConfig(backend="unsafe-host"))
     return MiniAgent(
         model_client=FakeModelClient(outputs),
         workspace=workspace,
@@ -38,12 +43,15 @@ def test_workspace_escape_is_rejected(tmp_path):
 def test_symlink_path_traversal_is_rejected(tmp_path):
     outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
     outside.write_text("outside\n", encoding="utf-8")
-    (tmp_path / "linked.txt").symlink_to(outside)
+    try:
+        (tmp_path / "linked.txt").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not permitted on this Windows host: {exc}")
     agent = build_agent(tmp_path, [])
 
     result = agent.run_tool("read_file", {"path": "linked.txt"})
 
-    assert "path escapes workspace" in result
+    assert "symlink/reparse paths are not allowed" in result
 
 
 def test_risky_tool_deny_behavior(tmp_path):
@@ -74,6 +82,8 @@ def test_cli_build_agent_wires_secret_env_names_from_parser(tmp_path):
                 str(tmp_path),
                 "--approval",
                 "auto",
+                "--shell-backend",
+                "disabled",
                 "--secret-env-name",
                 "GITHUB_PAT",
                 "--secret-env-name",
@@ -98,7 +108,7 @@ def test_cli_build_agent_uses_default_configured_secret_names(tmp_path):
         "codeforge.cli.OpenAICompatibleModelClient",
         DummyModelClient,
     ):
-        args = mini_cli.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--approval", "auto"])
+        args = mini_cli.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--approval", "auto", "--shell-backend", "disabled"])
         agent = mini_cli.build_agent(args)
         assert agent.secret_env_summary()["secret_env_names"] == ["GH_PAT"]
 
@@ -115,7 +125,7 @@ def test_cli_build_agent_loads_project_env_secrets_before_redaction_setup(tmp_pa
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
     (tmp_path / ".env").write_text("CODEFORGE_API_KEY=sk-project-secret\n", encoding="utf-8")
     with patch.dict(os.environ, {}, clear=True), patch("codeforge.cli.OpenAICompatibleModelClient", DummyModelClient):
-        args = mini_cli.build_arg_parser().parse_args(["--cwd", str(tmp_path)])
+        args = mini_cli.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--shell-backend", "disabled"])
         agent = mini_cli.build_agent(args)
         assert agent.secret_env_summary()["secret_env_names"] == ["CODEFORGE_API_KEY"]
 
@@ -138,7 +148,7 @@ def test_cli_build_agent_reads_secret_names_from_environment_config(tmp_path):
         },
         clear=True,
     ), patch("codeforge.cli.OpenAICompatibleModelClient", DummyModelClient):
-        args = mini_cli.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--approval", "auto"])
+        args = mini_cli.build_arg_parser().parse_args(["--cwd", str(tmp_path), "--approval", "auto", "--shell-backend", "disabled"])
         agent = mini_cli.build_agent(args)
         assert agent.secret_env_summary()["secret_env_names"] == ["MCA_CUSTOM_SECRET"]
 
@@ -147,7 +157,11 @@ def test_run_shell_uses_allowlisted_environment_only(tmp_path):
     secret = "shh-allowlist-secret"
     agent = build_agent(tmp_path, [], approval_policy="auto")
     script = 'import os; print(os.getenv("MCA_ALLOWLIST_SECRET", "missing"))'
-    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    command = (
+        subprocess.list2cmdline([sys.executable, "-c", script])
+        if os.name == "nt"
+        else f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    )
 
     with patch.dict(os.environ, {"MCA_ALLOWLIST_SECRET": secret}, clear=False):
         result = agent.run_tool("run_shell", {"command": command, "timeout": 20})
@@ -159,11 +173,14 @@ def test_run_shell_uses_allowlisted_environment_only(tmp_path):
 def test_bound_tool_methods_delegate_into_tools_module(tmp_path):
     agent = build_agent(tmp_path, [], approval_policy="auto")
 
-    with patch("codeforge.tools.subprocess.run") as fake_run:
+    with patch.object(agent.shell_sandbox, "run") as fake_run:
         fake_run.return_value = type(
             "Result",
             (),
-            {"returncode": 0, "stdout": "toolkit-shell\n", "stderr": ""},
+            {
+                "render": lambda self: "exit_code: 0\nstdout:\ntoolkit-shell\nstderr:\n(empty)",
+                "to_dict": lambda self: {"backend": "unsafe-host", "sandbox_status": "exited"},
+            },
         )()
         shell_result = agent.tool_run_shell({"command": "echo bypass", "timeout": 20})
 

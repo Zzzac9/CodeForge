@@ -63,3 +63,35 @@ def provider_env(name, legacy_names=(), default=""):
         if value:
             return value
     return default
+
+
+def provider_bool(name, legacy_names=(), default=False):
+    value = provider_env(name, legacy_names, "")
+    if value == "":
+        return bool(default)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
+
+
+def provider_int(name, legacy_names=(), default=0):
+    value = provider_env(name, legacy_names, "")
+    if value == "":
+        return int(default)
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
+
+
+def provider_float(name, legacy_names=(), default=0.0):
+    value = provider_env(name, legacy_names, "")
+    if value == "":
+        return float(default)
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a number") from None

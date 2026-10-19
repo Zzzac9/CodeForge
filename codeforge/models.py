@@ -128,11 +128,25 @@ def _extract_chat_result(data):
 
     content = message.get("content")
     if isinstance(content, str):
-        return content
+        text = content.strip()
+        if not text:
+            return ""
+        # With native Chat Completions tool calling, a normal assistant message
+        # means the model chose to finish rather than call another tool. Normalize
+        # plain provider text into the runtime's legacy <final> envelope so a valid
+        # final answer is not misclassified as a malformed response and retried.
+        if text.startswith("<tool>") or text.startswith("<final>"):
+            return text
+        return f"<final>{text}</final>"
     if isinstance(content, list):
         for item in content:
             if isinstance(item, dict) and item.get("text"):
-                return str(item["text"])
+                text = str(item["text"]).strip()
+                if not text:
+                    continue
+                if text.startswith("<tool>") or text.startswith("<final>"):
+                    return text
+                return f"<final>{text}</final>"
     return ""
 
 

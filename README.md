@@ -236,15 +236,37 @@ CodeForge 使用分层、可解释的文件记忆，而不是依赖向量数据�
 
 ## 安全设计
 
-CodeForge 的安全边界主要包括：
+CodeForge 的安全链按顺序执行：参数校验 → 操作级风险分析 → 强制安全边界 → 审批 → 执行。审批通过不等于安全检查通过；`auto` 只自动批准，不能越过禁止策略、只读模式或 Shell 后端边界。
 
-- **路径沙箱**：工具路径必须留在 workspace root 内。
-- **环境变量隔离**：Shell 只继承允许的环境变量。
+- **路径边界**：文件工具只接受 workspace root 内路径，并拒绝路径链中的符号链接和 Windows reparse point；这不是进程隔离意义上的“沙箱”。
+- **原子文件写入**：`write_file` / `patch_file` 使用同目录临时文件、`fsync` 和 `os.replace`，`patch_file` 在执行点再次检查 `old_text` 唯一匹配。
+- **Docker Shell 沙箱**：默认每次 `run_shell` 创建一个临时非 root 容器，只挂载工作区，禁网、只读根文件系统、丢弃 capabilities，并限制 CPU、内存、进程数、时间和输出。
+- **安全失败**：Docker 不可用、镜像缺失、启动失败或异常退出时不会回退到宿主机 Shell。
+- **显式宿主机模式**：`--shell-backend unsafe-host` 是独立的非安全兼容选项，`auto` 不会隐式启用它。
+- **环境变量隔离**：容器只收到 Shell 白名单中的非敏感环境变量；Docker CLI 连接变量不传入容器。
 - **Secret 脱敏**：Trace 和 Report 写盘前会替换已配置的敏感值。
-- **高风险审批**：写文件、Patch、Shell 命令可以要求人工确认。
+- **双层决策**：保留 Registry 的静态 `risky` 标记，同时记录具体操作的风险等级、目标、可能影响、未知影响、审批结果和安全检查结果。
 - **重复调用拦截**：避免相同工具调用陷入死循环。
 - **只读委派**：子 Agent 默认不能修改文件或执行高风险动作。
 - **深度限制**：避免无限递归委派。
+
+Shell 默认配置：
+
+```bash
+# 先由操作者显式准备受信任镜像；运行时不会自动 pull
+docker pull python:3.13-slim
+
+codeforge --shell-backend docker \
+  --docker-image python:3.13-slim \
+  --shell-workspace-mode read-only
+
+# 仅在明确接受宿主机执行风险时使用；不会由 auto 或故障回退触发
+codeforge --shell-backend unsafe-host
+```
+
+Windows 上启动时会探测 Docker Engine。Docker Desktop 已安装但未运行时，默认尝试启动并在 `--docker-startup-timeout` 内等待；可用 `--no-docker-auto-start` 禁止。退出时只清理本 CodeForge 实例创建且仍被跟踪的容器，不关闭 Docker Desktop，也不碰其他项目容器。
+
+Docker 显著缩小了进程可见的宿主资源，但不是绝对安全边界：仍需信任 Docker Engine、容器镜像、宿主内核与 Docker Desktop 的挂载实现。工作区设为 `read-write` 时，容器内命令仍可破坏已挂载文件；因此默认是 `read-only`，并额外禁止明显的整盘、根目录、工作区递归删除和 Docker Socket/特权逃逸操作。
 
 ## 会话、运行工件与审计
 

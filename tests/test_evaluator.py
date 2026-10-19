@@ -115,7 +115,10 @@ def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):
         "max_new_tokens": 64,
     }
     assert reproducibility["timezone"] == "Asia/Shanghai"
-    assert reproducibility["locale"] == "C.UTF-8"
+    # Locale is captured for reproducibility and is platform-specific (for
+    # example, Windows commonly reports a code-page locale rather than C.UTF-8).
+    assert isinstance(reproducibility["locale"], str)
+    assert reproducibility["locale"]
 
     for row in artifact["rows"]:
         assert not row["fixture_copy_relpath"].startswith("/")

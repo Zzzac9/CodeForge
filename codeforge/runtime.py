@@ -18,6 +18,13 @@ from pathlib import Path
 from . import memory as memorylib
 from .context_manager import ContextManager
 from .run_store import RunStore
+from .sandbox import DockerSandbox, SandboxUnavailableError, ShellSandboxConfig
+from .security import (
+    assess_tool_risk,
+    mandatory_safety_check,
+    render_approval_request,
+    secure_workspace_path,
+)
 from .task_state import TaskState
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
@@ -30,7 +37,12 @@ REDACTED_VALUE = "<redacted>"
 
 # Shell 环境变量白名单 —— 只有这些环境变量会被传递给子进程/shell 会话
 # 这是一种安全措施，防止敏感或无关的环境变量泄露给子进程
-DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
+DEFAULT_SHELL_ENV_ALLOWLIST = (
+    "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM",
+    "TMPDIR", "TMP", "TEMP", "USER",
+    # Windows shell=True needs these non-secret system variables to locate cmd.exe reliably.
+    "COMSPEC", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "PATHEXT",
+)
 
 # 默认功能开关 —— 控制 Claude Code 的核心功能是否启用
 DEFAULT_FEATURE_FLAGS = {
@@ -142,6 +154,9 @@ class CodeForge:
         shell_env_allowlist=None,
         secret_env_names=None,
         feature_flags=None,
+        shell_sandbox_config=None,
+        shell_sandbox=None,
+        initialize_shell=False,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -155,6 +170,18 @@ class CodeForge:
         self.read_only = read_only
         self.shell_env_allowlist = tuple(shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST)
         self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
+        if shell_sandbox_config is None:
+            shell_sandbox_config = ShellSandboxConfig()
+        elif isinstance(shell_sandbox_config, dict):
+            shell_sandbox_config = ShellSandboxConfig(**shell_sandbox_config)
+        self.shell_sandbox = shell_sandbox or DockerSandbox(
+            self.root,
+            shell_sandbox_config,
+            owner_id="codeforge-" + uuid.uuid4().hex[:12],
+        )
+        self.shell_startup_status = self.shell_sandbox.status.to_dict()
+        if initialize_shell:
+            self.shell_startup_status = self.shell_sandbox.initialize().to_dict()
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
@@ -186,6 +213,7 @@ class CodeForge:
         self.last_durable_rejections = []
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
+        self._last_shell_execution = {}
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -229,6 +257,12 @@ class CodeForge:
             "max_new_tokens": int(self.max_new_tokens),
             "feature_flags": dict(self.feature_flags),
             "shell_env_allowlist": list(self.shell_env_allowlist),
+            "shell_sandbox": {
+                "backend": self.shell_sandbox.config.backend,
+                "image": self.shell_sandbox.config.image,
+                "workspace_mode": self.shell_sandbox.config.workspace_mode,
+                "network": self.shell_sandbox.config.network,
+            },
             "workspace_fingerprint": getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", self.workspace.fingerprint()),
             "tool_signature": self.tool_signature(),
         }
@@ -280,6 +314,7 @@ class CodeForge:
                     "max_new_tokens",
                     "feature_flags",
                     "shell_env_allowlist",
+                    "shell_sandbox",
                     "workspace_fingerprint",
                     "tool_signature",
                 )
@@ -438,6 +473,7 @@ class CodeForge:
             - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
+            - After a successful write_file or patch_file, verify at most once unless there is a concrete new reason to inspect again, then return a final answer.
             - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
 
             Tools:
@@ -472,7 +508,9 @@ class CodeForge:
 
         # 工作区事实相对稳定，所以这里按整体刷新；
         # 只有这些事实真的变化了，才重建完整 prefix。
-        refreshed_workspace = WorkspaceContext.build(self.root)
+        # self.root is the established security boundary.  Refreshing facts must
+        # never rediscover an ancestor Git repo and silently widen that boundary.
+        refreshed_workspace = WorkspaceContext.build(self.root, repo_root_override=self.root)
         refreshed_workspace_fingerprint = refreshed_workspace.fingerprint()
 
         # force=True 时强制认为工作区变化；否则通过 fingerprint 判断
@@ -668,10 +706,13 @@ class CodeForge:
                 continue
             if any(part in IGNORED_PATH_NAMES for part in relative_parts):
                 continue
-            if not path.is_file():
+            # Snapshotting must not dereference a workspace symlink/junction and
+            # accidentally inspect a host file outside the configured root.
+            if path.is_symlink() or not path.is_file():
                 continue
             try:
-                snapshot[path.relative_to(self.root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+                checked = secure_workspace_path(self.root, path.relative_to(self.root))
+                snapshot[path.relative_to(self.root).as_posix()] = hashlib.sha256(checked.read_bytes()).hexdigest()
             except Exception:
                 continue
         return snapshot
@@ -1021,17 +1062,19 @@ class CodeForge:
             )
 
             if kind == "tool":
-                # 进入工具分支，统计本次 run 已经执行了多少步工具
-                tool_steps += 1
                 name = payload.get("name", "")
                 args = payload.get("args", {})
-
-                # 把工具调用记录进 TaskState，更新 tool_steps 和 last_tool
-                task_state.record_tool(name)
 
                 # 记录工具执行开始时间，用于后面统计工具耗时
                 tool_started_at = time.monotonic()
                 result = self.run_tool(name, args)
+
+                # rejected 调用没有真正执行，不消耗 tool step；否则计入预算。
+                # 这样重复调用/非法参数被拦截后，模型仍有机会下一轮返回 final。
+                tool_status = str((self._last_tool_result_metadata or {}).get("tool_status", ""))
+                if tool_status != "rejected":
+                    tool_steps += 1
+                    task_state.record_tool(name)
 
                 # 把工具执行结果写入 session history，下一轮 prompt 可以看到这次工具反馈
                 self.record(
@@ -1059,6 +1102,11 @@ class CodeForge:
                         **dict(self._last_tool_result_metadata or {}),
                     },
                 )
+
+                # 如果工具真的改了工作区，先刷新 workspace/prefix，再创建 checkpoint。
+                # 否则 checkpoint 会记录旧 fingerprint，下一轮会把“自己刚写的改动”误判为 workspace mismatch。
+                if (self._last_tool_result_metadata or {}).get("workspace_changed"):
+                    self.refresh_prefix()
 
                 # 工具执行后创建 checkpoint，方便后续 resume 时从关键状态接着跑
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
@@ -1180,8 +1228,9 @@ class CodeForge:
         是否需要回写记忆。
         """
         # 工具执行不是“直接调函数”，而是一条带护栏的流水线：
-        # 工具是否存在 -> 参数是否合法 -> 是否重复调用 -> 是否通过审批
-        # -> 真正执行 -> 更新记忆。
+        # 注册/参数 -> 动态风险 -> 强制安全边界 -> 审批 -> 执行。
+        # 审批和安全检查是两个独立结论；auto 只能影响前者。
+        args = args or {}
         tool = self.tools.get(name)
         if tool is None:
             # 工具不存在，直接拒绝，并记录一份统一格式的工具结果元数据
@@ -1190,7 +1239,11 @@ class CodeForge:
                 "tool_error_code": "unknown_tool",
                 "security_event_type": "",
                 "risk_level": "high",
+                "risk_summary": "unknown tool",
                 "read_only": False,
+                "approval_result": "not_requested",
+                "safety_check_passed": False,
+                "denial_reason": "tool is not registered",
                 "affected_paths": [],
                 "workspace_changed": False,
                 "diff_summary": [],
@@ -1214,12 +1267,52 @@ class CodeForge:
                 "tool_error_code": "invalid_arguments",
                 "security_event_type": security_event_type,
                 "risk_level": "high" if tool["risky"] else "low",
+                "risk_summary": "arguments did not pass validation",
                 "read_only": not tool["risky"],
+                "approval_result": "not_requested",
+                "safety_check_passed": False,
+                "denial_reason": str(exc),
                 "affected_paths": [],
                 "workspace_changed": False,
                 "diff_summary": [],
             }
             return message
+
+        assessment = assess_tool_risk(
+            name,
+            args,
+            tool,
+            self.root,
+            shell_backend=self.shell_sandbox.config.backend,
+        )
+        risk_fields = {
+            "risk_level": assessment.level,
+            "risk_summary": assessment.summary,
+            "target_paths": list(assessment.target_paths),
+            "possible_impacts": list(assessment.possible_impacts),
+            "unknown_impact": assessment.unknown_impact,
+        }
+        safety = mandatory_safety_check(
+            name,
+            assessment,
+            shell_backend=self.shell_sandbox.config.backend,
+            read_only=self.read_only,
+        )
+        if not safety.passed:
+            self._last_tool_result_metadata = {
+                "tool_status": "rejected",
+                "tool_error_code": "safety_boundary_denied",
+                "security_event_type": "prohibited_operation" if assessment.prohibited else "safety_boundary_denied",
+                **risk_fields,
+                "read_only": not tool["risky"],
+                "approval_result": "not_requested",
+                "safety_check_passed": False,
+                "denial_reason": safety.reason,
+                "affected_paths": [],
+                "workspace_changed": False,
+                "diff_summary": [],
+            }
+            return f"error: mandatory safety check denied {name}: {safety.reason}"
 
         if self.repeated_tool_call(name, args):
             # 拒绝连续重复的完全相同工具调用，防止模型原地打转
@@ -1228,21 +1321,31 @@ class CodeForge:
                 "tool_error_code": "repeated_identical_call",
                 "security_event_type": "",
                 "risk_level": "high" if tool["risky"] else "low",
+                "risk_summary": assessment.summary,
                 "read_only": not tool["risky"],
+                "approval_result": "not_requested",
+                "safety_check_passed": True,
+                "denial_reason": "repeated identical call",
                 "affected_paths": [],
                 "workspace_changed": False,
                 "diff_summary": [],
             }
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
 
-        if tool["risky"] and not self.approve(name, args):
+        approval_result = "not_required"
+        if tool["risky"]:
+            approval_result = "approved" if self.approve(name, args, assessment) else "denied"
+        if approval_result == "denied":
             # 高风险工具需要审批；审批失败就不执行
             self._last_tool_result_metadata = {
                 "tool_status": "rejected",
                 "tool_error_code": "approval_denied",
                 "security_event_type": "read_only_block" if self.read_only else "approval_denied",
-                "risk_level": "high",
+                **risk_fields,
                 "read_only": False,
+                "approval_result": "denied",
+                "safety_check_passed": True,
+                "denial_reason": "approval policy or user denied the operation",
                 "affected_paths": [],
                 "workspace_changed": False,
                 "diff_summary": [],
@@ -1252,6 +1355,7 @@ class CodeForge:
         # 高风险工具执行前先拍一份工作区快照，用于后面判断是否改动了文件
         before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
+        self._last_shell_execution = {}
         try:
             # 真正执行工具，并把输出裁剪到统一长度，避免结果过长塞爆 history/trace
             result = clip(tool["run"](args))
@@ -1277,6 +1381,9 @@ class CodeForge:
                     # 命令失败且没有产生文件改动，标记为普通工具失败
                     tool_status = "error"
                     tool_error_code = "tool_failed"
+                if self._last_shell_execution.get("timed_out"):
+                    tool_status = "partial_success" if workspace_changed else "error"
+                    tool_error_code = "tool_timeout"
 
             # 根据工具结果更新工作记忆，比如最近读过/改过的文件、文件摘要等
             self.update_memory_after_tool(name, args, result)
@@ -1286,12 +1393,17 @@ class CodeForge:
                 "tool_status": tool_status,
                 "tool_error_code": tool_error_code,
                 "security_event_type": "",
-                "risk_level": "high" if tool["risky"] else "low",
+                **risk_fields,
                 "read_only": not tool["risky"],
+                "approval_result": approval_result,
+                "safety_check_passed": True,
+                "denial_reason": "",
                 "affected_paths": affected_paths,
                 "workspace_changed": workspace_changed,
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
+                "sandbox": dict(self._last_shell_execution or {}),
+                "timed_out": bool(self._last_shell_execution.get("timed_out", False)),
             }
 
             # 把这次工具执行过程沉淀成过程笔记，方便后续复盘或记忆更新
@@ -1306,18 +1418,29 @@ class CodeForge:
 
             # 如果异常信息显示路径逃逸，就标记为安全事件
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
+            if isinstance(exc, SandboxUnavailableError):
+                security_event_type = "sandbox_unavailable"
 
             # 失败也记录统一格式的元数据；如果已经改了文件，就算 partial_success
             self._last_tool_result_metadata = {
                 "tool_status": "partial_success" if workspace_changed else "error",
-                "tool_error_code": "tool_partial_success" if workspace_changed else "tool_failed",
+                "tool_error_code": (
+                    "tool_partial_success" if workspace_changed
+                    else "sandbox_unavailable" if isinstance(exc, SandboxUnavailableError)
+                    else "tool_failed"
+                ),
                 "security_event_type": security_event_type,
-                "risk_level": "high" if tool["risky"] else "low",
+                **risk_fields,
                 "read_only": not tool["risky"],
+                "approval_result": approval_result,
+                "safety_check_passed": not isinstance(exc, SandboxUnavailableError),
+                "denial_reason": str(exc),
                 "affected_paths": affected_paths,
                 "workspace_changed": workspace_changed,
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
+                "sandbox": dict(self._last_shell_execution or self.shell_sandbox.status.to_dict() if name == "run_shell" else {}),
+                "timed_out": bool(self._last_shell_execution.get("timed_out", False)),
             }
 
             # 即使工具失败，也把失败过程记录下来，避免 trace/report 断档
@@ -1328,10 +1451,10 @@ class CodeForge:
         # agent 很常见的一种坏循环，是在没有新信息的情况下反复发起同一调用。
         # 这里提前挡掉最简单的这种循环。
         tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
-        if len(tool_events) < 2:
+        if not tool_events:
             return False
-        recent = tool_events[-2:]
-        return all(item["name"] == name and item["args"] == args for item in recent)
+        recent = tool_events[-1]
+        return recent["name"] == name and recent["args"] == args
 
     @staticmethod
     def new_task_id():
@@ -1360,6 +1483,8 @@ class CodeForge:
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
             "redacted_env": self.detected_secret_env_summary(),
+            "shell_startup_status": dict(self.shell_startup_status),
+            "last_tool_security": dict(self._last_tool_result_metadata or {}),
         }
 
     def tool_example(self, name):
@@ -1393,18 +1518,30 @@ class CodeForge:
     def tool_delegate(self, args):
         return toolkit.tool_delegate(self, args)
 
-    def approve(self, name, args):
+    def approve(self, name, args, assessment=None):
         if self.read_only:
             return False
         if self.approval_policy == "auto":
             return True
         if self.approval_policy == "never":
             return False
+        if assessment is None:
+            assessment = assess_tool_risk(
+                name,
+                args,
+                self.tools[name],
+                self.root,
+                shell_backend=self.shell_sandbox.config.backend,
+            )
         try:
-            answer = input(f"approve {name} {json.dumps(args, ensure_ascii=True)}? [y/N] ")
+            answer = input(render_approval_request(name, args, assessment, self.redact_artifact))
         except EOFError:
             return False
         return answer.strip().lower() in {"y", "yes"}
+
+    def close(self):
+        """Clean up only shell containers created by this runtime instance."""
+        return self.shell_sandbox.close()
 
     @staticmethod
     def parse(raw):
@@ -1545,14 +1682,9 @@ class CodeForge:
         self.session_store.save(self.session)
 
     def path(self, raw_path):
-        path = Path(raw_path)
-        path = path if path.is_absolute() else self.root / path
-        resolved = path.resolve()
-        # 所有文件类工具都被锚定在 workspace root 之下。
-        # 这样既能防住 "../" 逃逸，也能防住符号链接解析后跳出仓库。
-        if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
-            raise ValueError(f"path escapes workspace: {raw_path}")
-        return resolved
+        # 路径工具拒绝 workspace 外路径，也拒绝符号链接/Windows reparse point。
+        # 写工具会在原子 replace 前再次执行同一检查以缩小 TOCTOU 窗口。
+        return secure_workspace_path(self.root, raw_path, allow_missing=True)
 
 
 MiniAgent = CodeForge

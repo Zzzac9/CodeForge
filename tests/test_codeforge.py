@@ -14,17 +14,19 @@ from codeforge import (
     WorkspaceContext,
     build_welcome,
 )
+from codeforge.sandbox import ShellSandboxConfig
 
 
 def build_workspace(tmp_path):
     (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
-    return WorkspaceContext.build(tmp_path)
+    return WorkspaceContext.build(tmp_path, repo_root_override=tmp_path)
 
 
 def build_agent(tmp_path, outputs, **kwargs):
     workspace = build_workspace(tmp_path)
     store = SessionStore(tmp_path / ".codeforge" / "sessions")
     approval_policy = kwargs.pop("approval_policy", "auto")
+    kwargs.setdefault("shell_sandbox_config", ShellSandboxConfig(backend="unsafe-host"))
     return MiniAgent(
         model_client=FakeModelClient(outputs),
         workspace=workspace,
@@ -342,6 +344,33 @@ def test_openai_compatible_client_posts_expected_chat_payload():
     }
 
 
+def test_openai_compatible_client_wraps_plain_assistant_text_as_final():
+    class FakeResponse:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+        def read(self):
+            return json.dumps({
+                "choices": [{"message": {"role": "assistant", "content": "done with the file"}}]
+            }).encode("utf-8")
+
+    client = OpenAICompatibleModelClient(
+        model="compatible-model",
+        base_url="https://example.com/v1",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+    with patch("urllib.request.urlopen", return_value=FakeResponse()):
+        result = client.complete("hello", 42)
+
+    assert result == "<final>done with the file</final>"
+    kind, payload = MiniAgent.parse(result)
+    assert kind == "final"
+    assert payload == "done with the file"
+
+
 def test_explicit_prompt_cache_mode_sends_fields_and_records_usage():
     captured = {}
 
@@ -429,11 +458,16 @@ def test_successful_run_persists_run_artifacts_and_stop_reason(tmp_path):
 
 def test_trace_and_report_redact_secret_env_values(tmp_path):
     secret = "sk-test-secret-123"
+    shell_command = (
+        subprocess.list2cmdline([sys.executable, "-c", f"print({secret!r})"])
+        if os.name == "nt"
+        else f"printf '%s' '{secret}'"
+    )
     with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=True):
         agent = build_agent(
             tmp_path,
             [
-                '<tool>{"name":"run_shell","args":{"command":"printf \'%s\' \'sk-test-secret-123\'","timeout":20}}</tool>',
+                '<tool>' + json.dumps({"name": "run_shell", "args": {"command": shell_command, "timeout": 20}}) + '</tool>',
                 "<final>Masked.</final>",
             ],
         )
@@ -1188,7 +1222,7 @@ def test_build_arg_parser_exposes_one_model_protocol(tmp_path):
 
 def test_build_agent_uses_generic_openai_compatible_configuration(tmp_path):
     args = mini_pkg.build_arg_parser().parse_args(
-        ["--cwd", str(tmp_path), "--model", "override-model"]
+        ["--cwd", str(tmp_path), "--model", "override-model", "--shell-backend", "disabled"]
     )
     with patch.dict(
         os.environ,

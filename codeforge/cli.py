@@ -11,14 +11,16 @@
 """
 
 import argparse
+import atexit
 import os
 import shutil
 import sys
 import textwrap
 
-from .config import load_project_env, provider_env
+from .config import load_project_env, provider_bool, provider_env, provider_float, provider_int
 from .models import OpenAICompatibleModelClient
 from .runtime import CodeForge, SessionStore
+from .sandbox import ShellSandboxConfig
 from .workspace import WorkspaceContext, middle
 
 # 默认的敏感环境变量名单。
@@ -63,6 +65,9 @@ DEFAULT_MODEL = "deepseek-v4-pro"
 DEFAULT_API_BASE_URL = "https://api.deepseek.com"
 DEFAULT_API_TIMEOUT = 300
 DEFAULT_PROMPT_CACHE_MODE = "auto"
+DEFAULT_SHELL_BACKEND = "docker"
+DEFAULT_DOCKER_IMAGE = "python:3.13-slim"
+DEFAULT_SHELL_WORKSPACE_MODE = "read-only"
 LEGACY_SECRET_ENV_NAMES_VAR = "MINI_CODING_AGENT_SECRET_ENV_NAMES"
 SECRET_ENV_NAMES_VAR = "CODEFORGE_SECRET_ENV_NAMES"
 
@@ -198,6 +203,14 @@ def build_welcome(agent, model, host):
             row("WORKSPACE  " + middle(agent.workspace.cwd, inner - 11)),
             pair("MODEL", model, "BRANCH", agent.workspace.branch),
             pair("APPROVAL", agent.approval_policy, "SESSION", agent.session["id"]),
+            row(
+                "SHELL      "
+                + middle(
+                    f"{agent.shell_startup_status.get('backend', 'unknown')}:"
+                    f"{agent.shell_startup_status.get('state', 'unknown')}",
+                    inner - 11,
+                )
+            ),
             row(""),
         ]
     )
@@ -235,13 +248,35 @@ def build_agent(args):
     configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.codeforge/sessions")
     model = _build_model_client(args)
+    shell_config = ShellSandboxConfig(
+        backend=args.shell_backend or provider_env("CODEFORGE_SHELL_BACKEND", (), DEFAULT_SHELL_BACKEND),
+        image=args.docker_image or provider_env("CODEFORGE_DOCKER_IMAGE", (), DEFAULT_DOCKER_IMAGE),
+        workspace_mode=args.shell_workspace_mode or provider_env(
+            "CODEFORGE_SHELL_WORKSPACE_MODE", (), DEFAULT_SHELL_WORKSPACE_MODE
+        ),
+        network="none",
+        cpus=args.shell_cpus if args.shell_cpus is not None else provider_float("CODEFORGE_SHELL_CPUS", (), 1.0),
+        memory=args.shell_memory or provider_env("CODEFORGE_SHELL_MEMORY", (), "512m"),
+        pids_limit=args.shell_pids_limit if args.shell_pids_limit is not None else provider_int("CODEFORGE_SHELL_PIDS_LIMIT", (), 128),
+        output_limit=args.shell_output_limit if args.shell_output_limit is not None else provider_int("CODEFORGE_SHELL_OUTPUT_LIMIT", (), 65536),
+        startup_timeout=(
+            args.docker_startup_timeout
+            if args.docker_startup_timeout is not None
+            else provider_int("CODEFORGE_DOCKER_STARTUP_TIMEOUT", (), 30)
+        ),
+        auto_start_docker_desktop=(
+            args.docker_auto_start
+            if args.docker_auto_start is not None
+            else provider_bool("CODEFORGE_DOCKER_AUTO_START", (), True)
+        ),
+    )
     session_id = args.resume
     if session_id == "latest":
         # "latest" 表示自动选择最近的 session 文件恢复。
         session_id = store.latest()
     if session_id:
         # 恢复已有 session：保留历史对话和 working memory。
-        return CodeForge.from_session(
+        agent = CodeForge.from_session(
             model_client=model,
             workspace=workspace,
             session_store=store,
@@ -250,9 +285,13 @@ def build_agent(args):
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
             secret_env_names=configured_secret_names,
+            shell_sandbox_config=shell_config,
+            initialize_shell=True,
         )
+        atexit.register(agent.close)
+        return agent
     # 全新启动：创建空白 session。
-    return CodeForge(
+    agent = CodeForge(
         model_client=model,
         workspace=workspace,
         session_store=store,
@@ -260,7 +299,11 @@ def build_agent(args):
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         secret_env_names=configured_secret_names,
+        shell_sandbox_config=shell_config,
+        initialize_shell=True,
     )
+    atexit.register(agent.close)
+    return agent
 
 
 def build_arg_parser():
@@ -297,6 +340,34 @@ def build_arg_parser():
         help="Approval policy for risky tools.",
     )
     parser.add_argument(
+        "--shell-backend",
+        choices=("docker", "disabled", "unsafe-host"),
+        default=None,
+        help="Shell backend. unsafe-host is explicit non-sandboxed execution and is never a fallback.",
+    )
+    parser.add_argument(
+        "--docker-image",
+        default=None,
+        help="Trusted local image used by the Docker shell backend; CodeForge never pulls it implicitly.",
+    )
+    parser.add_argument(
+        "--shell-workspace-mode",
+        choices=("read-only", "read-write"),
+        default=None,
+        help="Docker workspace mount mode.",
+    )
+    parser.add_argument("--shell-cpus", type=float, default=None, help="Docker CPU limit.")
+    parser.add_argument("--shell-memory", default=None, help="Docker memory limit.")
+    parser.add_argument("--shell-pids-limit", type=int, default=None, help="Docker process limit.")
+    parser.add_argument("--shell-output-limit", type=int, default=None, help="Per-stream shell output byte limit.")
+    parser.add_argument("--docker-startup-timeout", type=int, default=None, help="Docker Desktop startup/readiness timeout.")
+    parser.add_argument(
+        "--docker-auto-start",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="On Windows, start Docker Desktop when installed but not ready.",
+    )
+    parser.add_argument(
         "--secret-env-name",
         dest="secret_env_names",
         action="append",
@@ -326,6 +397,10 @@ def main(argv=None):
     model = getattr(agent.model_client, "model", getattr(args, "model", DEFAULT_MODEL))
     host = getattr(agent.model_client, "base_url", getattr(args, "base_url", DEFAULT_API_BASE_URL))
     print(build_welcome(agent, model=model, host=host))
+    shell_status = agent.shell_startup_status
+    if shell_status.get("backend") == "docker" and shell_status.get("state") != "ready":
+        detail = shell_status.get("detail") or "Docker shell backend is not ready"
+        print(f"Docker shell unavailable (no host fallback): {detail}", file=sys.stderr)
 
     if args.prompt:
         # one-shot 模式：只跑一次 ask，不进入 REPL 循环。

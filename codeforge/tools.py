@@ -6,9 +6,9 @@
 
 import shutil
 import subprocess
-import textwrap
 from functools import partial
 
+from .security import atomic_write_text, read_text_secure, secure_workspace_path
 from .workspace import IGNORED_PATH_NAMES, clip
 
 # 基础工具规格表：定义模型能看到哪些工具、参数长什么样、是否高风险
@@ -35,7 +35,7 @@ BASE_TOOL_SPECS = {
         # 执行 shell 命令，属于高风险工具，需要走审批逻辑
         "schema": {"command": "str", "timeout": "int=20"},
         "risky": True,
-        "description": "Run a shell command in the repo root.",
+        "description": "Run a shell command with the configured isolated backend.",
     },
     "write_file": {
         # 写入文件，会改变工作区，所以标记为高风险
@@ -154,7 +154,7 @@ def validate_tool(agent, name, args):
             raise ValueError("old_text must not be empty")
         if "new_text" not in args:
             raise ValueError("missing new_text")
-        text = path.read_text(encoding="utf-8")
+        text = read_text_secure(agent.root, args["path"])
         count = text.count(old_text)
         if count != 1:
             raise ValueError(f"old_text must occur exactly once, found {count}")
@@ -199,7 +199,7 @@ def tool_read_file(agent, args):
         raise ValueError("invalid line range")
 
     # errors="replace" 避免个别非法字符导致整个读取失败
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    lines = read_text_secure(agent.root, args["path"], errors="replace").splitlines()
     body = "\n".join(f"{number:>4}: {line}" for number, line in enumerate(lines[start - 1:end], start=start))
     return f"# {path.relative_to(agent.root)}\n{body}"
 
@@ -209,15 +209,20 @@ def tool_search(agent, args):
     pattern = str(args.get("pattern", "")).strip()
     if not pattern:
         raise ValueError("pattern must not be empty")
-    path = agent.path(args.get("path", "."))
+    raw_path = args.get("path", ".")
+    path = agent.path(raw_path)
 
     if shutil.which("rg"):
         # 优先用 rg，因为搜索会非常频繁，搜索延迟会直接影响 agent 控制循环。
+        # Re-check immediately before handing the path to another process.
+        path = secure_workspace_path(agent.root, raw_path)
         result = subprocess.run(
             ["rg", "-n", "--smart-case", "--max-count", "200", pattern, str(path)],
             cwd=agent.root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         return result.stdout.strip() or result.stderr.strip() or "(no matches)"
 
@@ -225,12 +230,15 @@ def tool_search(agent, args):
     matches = []
     files = [path] if path.is_file() else [
         item for item in path.rglob("*")
-        if item.is_file() and not any(part in IGNORED_PATH_NAMES for part in item.relative_to(agent.root).parts)
+        if item.is_file()
+        and not item.is_symlink()
+        and not any(part in IGNORED_PATH_NAMES for part in item.relative_to(agent.root).parts)
     ]
 
     # 逐文件逐行做大小写不敏感匹配，最多返回 200 条
     for file_path in files:
-        for number, line in enumerate(file_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        relative = file_path.relative_to(agent.root)
+        for number, line in enumerate(read_text_secure(agent.root, relative, errors="replace").splitlines(), start=1):
             if pattern.lower() in line.lower():
                 matches.append(f"{file_path.relative_to(agent.root)}:{number}:{line}")
                 if len(matches) >= 200:
@@ -249,29 +257,13 @@ def tool_run_shell(agent, args):
     if timeout < 1 or timeout > 120:
         raise ValueError("timeout must be in [1, 120]")
 
-    # 在仓库根目录执行命令，并捕获 stdout/stderr
-    result = subprocess.run(
-        command,
-        cwd=agent.root,
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        # 这里传入的是过滤后的环境变量，而不是直接继承整个父 shell 环境，
-        # 目的是减少敏感信息被意外带进命令执行环境的风险。
-        env=agent.shell_env(),
-    )
-
-    # 把退出码、标准输出和错误输出统一包装成文本返回给模型
-    return textwrap.dedent(
-        f"""\
-        exit_code: {result.returncode}
-        stdout:
-        {result.stdout.strip() or "(empty)"}
-        stderr:
-        {result.stderr.strip() or "(empty)"}
-        """
-    ).strip()
+    # Docker 是默认后端。Docker 不可用时会安全失败，不会悄悄改跑宿主机。
+    try:
+        result = agent.shell_sandbox.run(command, timeout, agent.shell_env())
+    finally:
+        agent.shell_startup_status = agent.shell_sandbox.status.to_dict()
+    agent._last_shell_execution = result.to_dict()
+    return result.render()
 
 
 def tool_write_file(agent, args):
@@ -279,9 +271,8 @@ def tool_write_file(agent, args):
     path = agent.path(args["path"])
     content = str(args["content"])
 
-    # 确保父目录存在，然后写入 UTF-8 文本
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    # 同目录临时文件 + fsync + os.replace，避免中断留下半截文件。
+    path = atomic_write_text(agent.root, args["path"], content)
 
     # 返回写入结果和字符数，方便 trace/history 记录
     return f"wrote {path.relative_to(agent.root)} ({len(content)} chars)"
@@ -301,13 +292,17 @@ def tool_patch_file(agent, args):
         raise ValueError("missing new_text")
 
     # old_text 必须只出现一次，避免误改多个位置
-    text = path.read_text(encoding="utf-8")
+    text = read_text_secure(agent.root, args["path"])
     count = text.count(old_text)
     if count != 1:
         raise ValueError(f"old_text must occur exactly once, found {count}")
 
-    # 只替换第一次匹配，保证修改范围可控
-    path.write_text(text.replace(old_text, str(args["new_text"]), 1), encoding="utf-8")
+    # 执行前再次读取并检查唯一匹配，再原子替换，避免验证与写入之间使用旧内容。
+    text = read_text_secure(agent.root, args["path"])
+    count = text.count(old_text)
+    if count != 1:
+        raise ValueError(f"old_text must occur exactly once, found {count}")
+    path = atomic_write_text(agent.root, args["path"], text.replace(old_text, str(args["new_text"]), 1))
     return f"patched {path.relative_to(agent.root)}"
 
 
@@ -337,6 +332,7 @@ def tool_delegate(agent, args):
         read_only=True,
         secret_env_names=agent.secret_env_names,
         shell_env_allowlist=agent.shell_env_allowlist,
+        shell_sandbox_config=agent.shell_sandbox.config,
     )
 
     # 委派的目标是“调查”，不是“放权执行”。

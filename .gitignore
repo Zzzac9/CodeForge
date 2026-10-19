@@ -42,6 +42,14 @@ readme_intro_locked/
 
 # Local docs not intended for publication
 docs/
+!docs/
+docs/*
+!docs/architecture/
+docs/architecture/*
+!docs/architecture/agent-harness-v1-overview.md
+!docs/review-pack/
+docs/review-pack/*
+!docs/review-pack/README.md
 
 # OS files
 .DS_Store
