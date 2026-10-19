@@ -132,6 +132,8 @@ codeforge
 
 模型回答默认通过服务端 SSE 流式显示。Agent 调用工具时，终端会同步显示当前轮次和步骤，例如“读取文件 README.md”；工具调用正文不会作为模型回答打印，步骤参数会先经过现有敏感信息脱敏。
 
+DeepSeek thinking 响应会把推理 token 放在 `reasoning_content`，它不作为答案打印或写入 Trace。CodeForge 只记录 `finish_reason`、usage、可见文本长度、推理文本长度、工具调用数量和 SSE 分片计数。默认单轮输出上限为 4096 tokens；如果模型在没有任何可见文本或工具调用时因 token 上限截断，Runtime 最多自动重试一次，并把上限提高到受限值。仍然失败时会明确报告 `output_truncated`，同时把本次 TaskState 标记为 failed，绝不会把空响应当作成功。
+
 临时覆盖模型或 API 地址：
 
 ```bash

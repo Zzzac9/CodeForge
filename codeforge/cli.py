@@ -169,6 +169,13 @@ class ConsoleProgressRenderer:
             self._feed_delta(str(event.get("text", "")))
         elif kind == "model_finished":
             self._finish_model(str(event.get("kind", "")))
+        elif kind == "model_failed":
+            self._finish_model("error")
+            self._status(f"模型响应失败：{event.get('error_code', 'model_request_failed')}")
+        elif kind == "model_retry_scheduled":
+            self._status(
+                f"安全重试一次（max_tokens={event.get('next_max_tokens', '?')}）…"
+            )
         elif kind == "tool_started":
             description = self._tool_description(
                 str(event.get("name", "")), dict(event.get("args", {}) or {})
@@ -195,6 +202,7 @@ def _run_request(agent, prompt):
 DEFAULT_MODEL = "deepseek-flash"
 DEFAULT_API_BASE_URL = "https://api.deepseek.com"
 DEFAULT_API_TIMEOUT = 300
+DEFAULT_MAX_NEW_TOKENS = 4096
 DEFAULT_PROMPT_CACHE_MODE = "auto"
 DEFAULT_SHELL_BACKEND = "docker"
 DEFAULT_DOCKER_IMAGE = "python:3.13-slim"
@@ -506,7 +514,12 @@ def build_arg_parser():
         help="Extra environment variable names to redact from trace/report.",
     )
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=DEFAULT_MAX_NEW_TOKENS,
+        help="Maximum model output tokens per step.",
+    )
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature.")
     return parser
 

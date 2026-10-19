@@ -17,6 +17,7 @@ from pathlib import Path
 
 from . import memory as memorylib
 from .context_manager import ContextManager
+from .models import ModelCompletionError
 from .run_store import RunStore
 from .sandbox import DockerSandbox, SandboxUnavailableError, ShellSandboxConfig
 from .security import (
@@ -923,6 +924,9 @@ class CodeForge:
         run_started_at = time.monotonic()
         # 把当前用户请求写入工作记忆的任务摘要，方便后续 prompt 继续围绕这个目标推进
         self.memory.set_task_summary(user_message)
+        # The current request has its own prompt section. Keep it durably in
+        # history now, while letting ContextManager omit this active copy.
+        self._active_user_history_index = len(self.session["history"])
         # 把用户消息写入 session history，并记录创建时间
         self.record({"role": "user", "content": user_message, "created_at": now()})
         # 创建本次运行的 TaskState；run_id 标识一次运行，task_id 标识一次用户任务
@@ -952,6 +956,8 @@ class CodeForge:
 
         # 已调用模型的轮数
         attempts = 0
+        semantic_retry_count = 0
+        completion_token_limit = self.max_new_tokens
 
         # 最大尝试次数；通常是工具步数上限的 3 倍，但至少比 max_steps 多 4 次
         # 这样可以给解析失败、retry、格式修正留出一点余量
@@ -1043,18 +1049,82 @@ class CodeForge:
             model_started_at = time.monotonic()
 
             # 调用模型后端，传入完整 prompt、最大输出 token，以及可选的 prompt cache 参数
-            raw = self.model_client.complete(
-                prompt,
-                self.max_new_tokens,
-                prompt_cache_key=prompt_cache_key,
-                prompt_cache_retention=prompt_cache_retention,
-                tools=self.model_tool_specs(),
-                on_token=(
-                    (lambda token: progress("model_delta", text=token))
-                    if progress_callback is not None
-                    else None
-                ),
-            )
+            try:
+                raw = self.model_client.complete(
+                    prompt,
+                    completion_token_limit,
+                    prompt_cache_key=prompt_cache_key,
+                    prompt_cache_retention=prompt_cache_retention,
+                    tools=self.model_tool_specs(),
+                    on_token=(
+                        (lambda token: progress("model_delta", text=token))
+                        if progress_callback is not None
+                        else None
+                    ),
+                )
+            except Exception as exc:
+                completion_metadata = dict(
+                    getattr(exc, "metadata", None)
+                    or getattr(self.model_client, "last_completion_metadata", {})
+                    or {}
+                )
+                error_code = getattr(exc, "code", "model_request_failed")
+                retryable = bool(getattr(exc, "retryable", False))
+                safe_error = self.redact_text(str(exc))
+                self.last_completion_metadata = completion_metadata
+                prompt_metadata.update(completion_metadata)
+                self.last_prompt_metadata = prompt_metadata
+                self.emit_trace(
+                    task_state,
+                    "model_failed",
+                    {
+                        "error_code": error_code,
+                        "retryable": retryable,
+                        "completion_metadata": completion_metadata,
+                        "duration_ms": int((time.monotonic() - model_started_at) * 1000),
+                    },
+                )
+                progress("model_failed", error_code=error_code, retryable=retryable)
+
+                if isinstance(exc, ModelCompletionError) and retryable and semantic_retry_count < 1:
+                    semantic_retry_count += 1
+                    previous_limit = completion_token_limit
+                    completion_token_limit = min(8192, max(4096, completion_token_limit * 4))
+                    self.emit_trace(
+                        task_state,
+                        "model_retry_scheduled",
+                        {
+                            "error_code": error_code,
+                            "retry_number": semantic_retry_count,
+                            "previous_max_tokens": previous_limit,
+                            "next_max_tokens": completion_token_limit,
+                        },
+                    )
+                    progress(
+                        "model_retry_scheduled",
+                        error_code=error_code,
+                        next_max_tokens=completion_token_limit,
+                    )
+                    continue
+
+                task_state.stop_model_error(safe_error)
+                self.run_store.write_task_state(task_state)
+                self.emit_trace(
+                    task_state,
+                    "run_finished",
+                    {
+                        "status": task_state.status,
+                        "stop_reason": task_state.stop_reason,
+                        "error_code": error_code,
+                        "run_duration_ms": int((time.monotonic() - run_started_at) * 1000),
+                    },
+                )
+                self.run_store.write_report(
+                    task_state,
+                    self.redact_artifact(self.build_report(task_state)),
+                )
+                self._active_user_history_index = None
+                raise RuntimeError(f"{error_code}: {safe_error}") from exc
 
             # 读取模型客户端留下的元数据，例如 usage、cached_tokens、cache_hit 等
             completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
@@ -1201,6 +1271,7 @@ class CodeForge:
             # 构建最终 report，脱敏后落盘
             self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
             # 返回最终回答给调用方
+            self._active_user_history_index = None
             return final
 
         if attempts >= max_attempts and tool_steps < self.max_steps:
@@ -1243,6 +1314,7 @@ class CodeForge:
         # 构建最终 report，脱敏后落盘
         self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
         # 返回停止说明给调用方
+        self._active_user_history_index = None
         return final
 
     def run_tool(self, name, args):

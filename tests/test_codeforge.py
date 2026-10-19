@@ -17,6 +17,7 @@ from codeforge import (
 )
 from codeforge.sandbox import ShellSandboxConfig
 from codeforge.cli import ConsoleProgressRenderer
+from codeforge.models import ModelCompletionError
 
 
 def build_workspace(tmp_path):
@@ -53,6 +54,23 @@ def test_agent_runs_tool_then_final(tmp_path):
     assert answer == "Read the file successfully."
     assert any(item["role"] == "tool" and item["name"] == "read_file" for item in agent.session["history"])
     assert "hello.txt" in agent.session["memory"]["files"]
+
+
+def test_agent_reads_four_files_then_returns_summary(tmp_path):
+    for index in range(1, 5):
+        (tmp_path / f"{index}.py").write_text(f"VALUE = {index}\n", encoding="utf-8")
+    outputs = [
+        f'<tool>{{"name":"read_file","args":{{"path":"{index}.py","start":1,"end":20}}}}</tool>'
+        for index in range(1, 5)
+    ]
+    outputs.append("<final>All four files define their corresponding numeric value.</final>")
+    agent = build_agent(tmp_path, outputs, max_steps=6)
+
+    answer = agent.ask("Read 1.py, 2.py, 3.py, and 4.py, then summarize them.")
+
+    assert answer == "All four files define their corresponding numeric value."
+    reads = [item for item in agent.session["history"] if item.get("name") == "read_file"]
+    assert [item["args"]["path"] for item in reads] == ["1.py", "2.py", "3.py", "4.py"]
 
 
 def test_agent_updates_task_summary_on_each_request(tmp_path):
@@ -1464,3 +1482,231 @@ def test_console_progress_streams_final_and_hides_tool_markup():
     assert "<tool>" not in output.getvalue()
     assert "读取文件 README.md" in status.getvalue()
     assert "正在思考（第 2 轮）" in status.getvalue()
+
+
+def test_streaming_reasoning_only_length_is_classified_with_safe_diagnostics():
+    class FakeStreamingResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            chunks = [
+                {"choices": [{"delta": {"reasoning_content": "private thought"}, "finish_reason": None}]},
+                {
+                    "choices": [{"delta": {}, "finish_reason": "length"}],
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 512,
+                        "total_tokens": 532,
+                        "completion_tokens_details": {"reasoning_tokens": 512},
+                    },
+                },
+            ]
+            for chunk in chunks:
+                yield ("data: " + json.dumps(chunk) + "\n\n").encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+    client = OpenAICompatibleModelClient(
+        model="deepseek-flash",
+        base_url="https://api.deepseek.com",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+    with patch("urllib.request.urlopen", return_value=FakeStreamingResponse()), patch.object(
+        client, "api_key", "sk-test"
+    ):
+        try:
+            client.complete("prompt", 512, on_token=lambda token: None)
+        except ModelCompletionError as exc:
+            error = exc
+        else:
+            raise AssertionError("reasoning-only truncation must fail")
+
+    assert error.code == "output_truncated"
+    assert error.retryable is True
+    metadata = error.metadata
+    assert metadata["finish_reason"] == "length"
+    assert metadata["visible_content_chars"] == 0
+    assert metadata["reasoning_content_chars"] == len("private thought")
+    assert metadata["tool_calls_count"] == 0
+    assert metadata["reasoning_tokens"] == 512
+    assert metadata["sse_event_count"] == 2
+    assert metadata["sse_reasoning_delta_count"] == 1
+    assert metadata["sse_done_received"] is True
+    assert "private thought" not in json.dumps(metadata)
+
+
+def test_non_streaming_reasoning_only_length_uses_same_error_classification():
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [{
+                        "finish_reason": "length",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning_content": "hidden reasoning",
+                        },
+                    }],
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 512,
+                        "total_tokens": 532,
+                        "completion_tokens_details": {"reasoning_tokens": 512},
+                    },
+                }
+            ).encode("utf-8")
+
+    client = OpenAICompatibleModelClient(
+        model="deepseek-flash",
+        base_url="https://api.deepseek.com",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+    with patch("urllib.request.urlopen", return_value=FakeResponse()):
+        try:
+            client.complete("prompt", 512)
+        except ModelCompletionError as exc:
+            error = exc
+        else:
+            raise AssertionError("non-stream reasoning-only truncation must fail")
+
+    assert error.code == "output_truncated"
+    assert error.metadata["response_mode"] == "non_stream"
+    assert error.metadata["finish_reason"] == "length"
+    assert error.metadata["reasoning_content_chars"] == len("hidden reasoning")
+    assert error.metadata["requested_max_tokens"] == 512
+    assert "hidden reasoning" not in json.dumps(error.metadata)
+
+
+def test_runtime_retries_reasoning_only_failure_once_with_larger_limit(tmp_path):
+    class RecoveringModel:
+        supports_prompt_cache = False
+        uses_explicit_prompt_cache = False
+        prompt_cache_strategy = "off"
+
+        def __init__(self):
+            self.calls = []
+            self.prompts = []
+            self.last_completion_metadata = {}
+
+        def complete(self, prompt, max_new_tokens, **kwargs):
+            self.calls.append(max_new_tokens)
+            self.prompts.append(prompt)
+            if len(self.calls) == 1:
+                metadata = {
+                    "finish_reason": "length",
+                    "visible_content_chars": 0,
+                    "reasoning_content_chars": 1200,
+                    "tool_calls_count": 0,
+                    "output_tokens": 512,
+                }
+                self.last_completion_metadata = metadata
+                raise ModelCompletionError(
+                    "truncated",
+                    code="output_truncated",
+                    metadata=metadata,
+                    retryable=True,
+                )
+            self.last_completion_metadata = {
+                "finish_reason": "stop",
+                "visible_content_chars": 9,
+                "reasoning_content_chars": 0,
+                "tool_calls_count": 0,
+            }
+            return "<final>Recovered.</final>"
+
+    workspace = build_workspace(tmp_path)
+    model = RecoveringModel()
+    agent = MiniAgent(
+        model_client=model,
+        workspace=workspace,
+        session_store=SessionStore(tmp_path / ".codeforge" / "sessions"),
+        approval_policy="auto",
+        max_new_tokens=512,
+        shell_sandbox_config=ShellSandboxConfig(backend="disabled"),
+    )
+    events = []
+
+    assert agent.ask("unique active request", progress_callback=events.append) == "Recovered."
+    assert model.calls == [512, 4096]
+    assert sum(item["event"] == "model_retry_scheduled" for item in events) == 1
+    assert "[user] unique active request" not in model.prompts[0]
+    assert [item["role"] for item in agent.session["history"]] == ["user", "assistant"]
+    trace = [
+        json.loads(line)
+        for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
+    ]
+    failure = [item for item in trace if item["event"] == "model_failed"][-1]
+    assert failure["error_code"] == "output_truncated"
+    assert failure["completion_metadata"]["finish_reason"] == "length"
+
+
+def test_terminal_model_failure_does_not_poison_followup_session(tmp_path):
+    class FailThenAnswerModel:
+        supports_prompt_cache = False
+        uses_explicit_prompt_cache = False
+        prompt_cache_strategy = "off"
+
+        def __init__(self):
+            self.calls = 0
+            self.last_completion_metadata = {}
+
+        def complete(self, prompt, max_new_tokens, **kwargs):
+            self.calls += 1
+            if self.calls <= 2:
+                metadata = {
+                    "finish_reason": "length",
+                    "visible_content_chars": 0,
+                    "reasoning_content_chars": 512,
+                    "tool_calls_count": 0,
+                }
+                self.last_completion_metadata = metadata
+                raise ModelCompletionError(
+                    "truncated",
+                    code="output_truncated",
+                    metadata=metadata,
+                    retryable=True,
+                )
+            self.last_completion_metadata = {"finish_reason": "stop"}
+            return "<final>The previous request was truncated; this session is still usable.</final>"
+
+    workspace = build_workspace(tmp_path)
+    agent = MiniAgent(
+        model_client=FailThenAnswerModel(),
+        workspace=workspace,
+        session_store=SessionStore(tmp_path / ".codeforge" / "sessions"),
+        approval_policy="auto",
+        max_new_tokens=512,
+        shell_sandbox_config=ShellSandboxConfig(backend="disabled"),
+    )
+
+    try:
+        agent.ask("first request")
+    except RuntimeError as exc:
+        assert "output_truncated" in str(exc)
+    else:
+        raise AssertionError("terminal model failure must be raised")
+
+    failed_state = agent.current_task_state
+    assert failed_state.status == "failed"
+    assert failed_state.stop_reason == "model_error"
+    assert agent.run_store.report_path(failed_state).exists()
+    assert [item["role"] for item in agent.session["history"]] == ["user"]
+    assert "output_truncated" not in agent.session_path.read_text(encoding="utf-8")
+
+    answer = agent.ask("why did it fail?")
+    assert "still usable" in answer
+    assert [item["role"] for item in agent.session["history"]] == ["user", "user", "assistant"]

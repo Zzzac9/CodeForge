@@ -56,3 +56,10 @@ docs/review-pack/*
 
 # Packaging metadata
 codeforge.egg-info/
+
+# Pytest temporary execution directories
+.pytest-*/
+.test-temp-*/
+
+# Local live API reproduction fixtures
+tests/fixtures/deepseek_live_repro/

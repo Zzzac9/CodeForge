@@ -267,7 +267,7 @@ class ContextManager:
         relevant_raw = "\n".join(relevant_lines)
 
         # history 从 agent.session["history"] 里取；这里先转 list，避免后续操作影响原始对象
-        history = list(getattr(self.agent, "session", {}).get("history", []))
+        history = self._history_for_render()
         history_raw = self._raw_history_text(history)
 
         # 返回每个 section 的 SectionRender；因为不裁剪，所以 raw 和 rendered 基本相同
@@ -412,7 +412,7 @@ class ContextManager:
 
     def _render_history_section(self, budget):
         # 从 session 里拿完整历史，然后渲染成 Transcript section
-        history = list(getattr(self.agent, "session", {}).get("history", []))
+        history = self._history_for_render()
         raw = self._raw_history_text(history)
 
         if not history:
@@ -554,6 +554,14 @@ class ContextManager:
             entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
 
         return entries, details
+
+    def _history_for_render(self):
+        """Return history without duplicating the active request section."""
+        history = list(getattr(self.agent, "session", {}).get("history", []))
+        active_index = getattr(self.agent, "_active_user_history_index", None)
+        if isinstance(active_index, int) and 0 <= active_index < len(history):
+            history.pop(active_index)
+        return history
 
 
     def _reusable_file_summary(self, path):

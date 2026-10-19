@@ -17,6 +17,17 @@ import urllib.error
 import urllib.request
 
 OPENAI_COMPATIBLE_USER_AGENT = "codeforge/0.1"
+_SSE_DONE = object()
+
+
+class ModelCompletionError(RuntimeError):
+    """A classified provider response failure with content-free diagnostics."""
+
+    def __init__(self, message, *, code="model_error", metadata=None, retryable=False):
+        super().__init__(message)
+        self.code = str(code)
+        self.metadata = dict(metadata or {})
+        self.retryable = bool(retryable)
 
 
 class FakeModelClient:
@@ -177,6 +188,9 @@ def _extract_usage_cache_details(data):
         "cache_miss_tokens": cache_miss_tokens,
         "cache_hit": cached_tokens > 0,
         "cache_usage_reported": cache_fields_reported,
+        "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get(
+            "reasoning_tokens"
+        ),
     }
 
 
@@ -192,7 +206,8 @@ def _iter_sse_events(response):
             continue
         payload = line[len("data:"):].strip()
         if payload == "[DONE]":
-            break
+            yield _SSE_DONE
+            return
         try:
             yield json.loads(payload)
         except json.JSONDecodeError as exc:
@@ -204,9 +219,23 @@ def _iter_sse_events(response):
 def _consume_stream(response, on_token):
     """Consume content/tool deltas and rebuild one normal response object."""
     content_parts = []
+    reasoning_parts = []
     tool_calls = {}
     usage = {}
+    finish_reason = None
+    diagnostics = {
+        "response_mode": "stream",
+        "sse_event_count": 0,
+        "sse_content_delta_count": 0,
+        "sse_reasoning_delta_count": 0,
+        "sse_tool_call_delta_count": 0,
+        "sse_done_received": False,
+    }
     for event in _iter_sse_events(response):
+        if event is _SSE_DONE:
+            diagnostics["sse_done_received"] = True
+            break
+        diagnostics["sse_event_count"] += 1
         if event.get("error"):
             raise RuntimeError(f"OpenAI-compatible error: {event['error']}")
         if isinstance(event.get("usage"), dict):
@@ -214,13 +243,22 @@ def _consume_stream(response, on_token):
         choices = event.get("choices") or []
         if not choices:
             continue
-        delta = choices[0].get("delta") or {}
+        choice = choices[0]
+        if choice.get("finish_reason") is not None:
+            finish_reason = str(choice.get("finish_reason"))
+        delta = choice.get("delta") or {}
         content = delta.get("content")
         if isinstance(content, str) and content:
             content_parts.append(content)
+            diagnostics["sse_content_delta_count"] += 1
             if on_token is not None:
                 on_token(content)
+        reasoning = delta.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            reasoning_parts.append(reasoning)
+            diagnostics["sse_reasoning_delta_count"] += 1
         for item in delta.get("tool_calls") or []:
+            diagnostics["sse_tool_call_delta_count"] += 1
             index = int(item.get("index", 0))
             current = tool_calls.setdefault(
                 index,
@@ -234,10 +272,40 @@ def _consume_stream(response, on_token):
             if function.get("arguments"):
                 current["function"]["arguments"] += str(function["arguments"])
 
-    message = {"role": "assistant", "content": "".join(content_parts) or None}
+    message = {
+        "role": "assistant",
+        "content": "".join(content_parts) or None,
+        "reasoning_content": "".join(reasoning_parts) or None,
+    }
     if tool_calls:
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
-    return {"choices": [{"message": message}], "usage": usage}
+    return {
+        "choices": [{"message": message, "finish_reason": finish_reason}],
+        "usage": usage,
+        "_codeforge_stream_diagnostics": diagnostics,
+    }
+
+
+def _response_shape_details(data):
+    choices = data.get("choices") or []
+    choice = choices[0] if choices else {}
+    message = choice.get("message") or {}
+    content = message.get("content")
+    reasoning = message.get("reasoning_content")
+    tool_calls = message.get("tool_calls") or []
+    stream_details = data.get("_codeforge_stream_diagnostics") or {}
+    return {
+        "finish_reason": choice.get("finish_reason"),
+        "visible_content_chars": len(content) if isinstance(content, str) else 0,
+        "reasoning_content_chars": len(reasoning) if isinstance(reasoning, str) else 0,
+        "tool_calls_count": len(tool_calls),
+        "response_mode": stream_details.get("response_mode", "non_stream"),
+        "sse_event_count": int(stream_details.get("sse_event_count", 0)),
+        "sse_content_delta_count": int(stream_details.get("sse_content_delta_count", 0)),
+        "sse_reasoning_delta_count": int(stream_details.get("sse_reasoning_delta_count", 0)),
+        "sse_tool_call_delta_count": int(stream_details.get("sse_tool_call_delta_count", 0)),
+        "sse_done_received": bool(stream_details.get("sse_done_received", False)),
+    }
 
 
 class OpenAICompatibleModelClient:
@@ -385,11 +453,41 @@ class OpenAICompatibleModelClient:
             prompt_cache_key,
             prompt_cache_retention,
         )
+        self.last_completion_metadata["requested_max_tokens"] = int(max_new_tokens)
+        finish_reason = self.last_completion_metadata.get("finish_reason")
+        visible_chars = int(self.last_completion_metadata.get("visible_content_chars", 0))
+        tool_calls_count = int(self.last_completion_metadata.get("tool_calls_count", 0))
+        reasoning_chars = int(self.last_completion_metadata.get("reasoning_content_chars", 0))
+        if finish_reason == "length":
+            raise ModelCompletionError(
+                "Model output was truncated at the configured token limit "
+                f"(visible_chars={visible_chars}, reasoning_chars={reasoning_chars}, "
+                f"tool_calls={tool_calls_count}).",
+                code="output_truncated",
+                metadata=self.last_completion_metadata,
+                retryable=visible_chars == 0 and tool_calls_count == 0,
+            )
+        if finish_reason in {"content_filter", "aborted", "insufficient_system_resource"}:
+            raise ModelCompletionError(
+                f"Model stopped without a usable completion (finish_reason={finish_reason}).",
+                code=f"finish_reason_{finish_reason}",
+                metadata=self.last_completion_metadata,
+                retryable=(
+                    finish_reason in {"aborted", "insufficient_system_resource"}
+                    and visible_chars == 0
+                    and tool_calls_count == 0
+                ),
+            )
         text = _extract_chat_result(data)
         if text:
             return text
-        raise RuntimeError(
-            "OpenAI-compatible error: could not extract text or tool call from response"
+        code = "reasoning_only_response" if reasoning_chars else "empty_response"
+        raise ModelCompletionError(
+            "Model returned no visible text or tool call "
+            f"(finish_reason={finish_reason or 'unknown'}, reasoning_chars={reasoning_chars}).",
+            code=code,
+            metadata=self.last_completion_metadata,
+            retryable=finish_reason in {None, "stop"},
         )
 
     def _record_completion_metadata(
@@ -411,4 +509,5 @@ class OpenAICompatibleModelClient:
                 prompt_cache_retention if self.uses_explicit_prompt_cache else None
             ),
             **usage,
+            **_response_shape_details(data),
         }
